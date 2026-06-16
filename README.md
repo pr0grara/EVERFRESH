@@ -285,12 +285,45 @@ particle get <device-name> fanDuty
 ```
 
 **Cloud variables:** `canopyTempF`, `canopyRH`, `trunkTempF`, `trunkRH`,
-`fanDuty`, `status`. A sensor reading of `-1` means that sensor is currently
-invalid.
+`fanDuty`, `heat` (0/1), `fog` (0/1), `mode` (`auto`/`manual`), `status`. A sensor
+reading of `-1` means that sensor is currently invalid.
 
-**Published event:** every 60 s the device publishes an `everfresh` event with the
-status string — hook this to a webhook / IFTTT / email for alerts (e.g. notify on
-`ALARM` or `OVERHEAT`).
+**Published events:**
+
+| Event                   | When                              | Payload                          |
+|-------------------------|-----------------------------------|----------------------------------|
+| `everfresh/telemetry`   | every 60 s                        | JSON snapshot (see below)        |
+| `everfresh/alert`       | only when alert state *changes*   | `no-sensor` / `overheat` / `cleared` |
+| `everfresh/cmd`         | when a manual override is invoked | what was commanded               |
+
+Telemetry JSON (compact, under the 255-byte event limit):
+
+```json
+{"ct":78.4,"crh":61,"tt":77.9,"trh":63,"heat":0,"fog":0,"fan":50,"mode":"auto"}
+```
+
+Keys: `ct`/`crh` = canopy temp/RH, `tt`/`trh` = trunk temp/RH, `heat`/`fog` =
+actuator state (0/1), `fan` = duty %, `mode` = auto or manual. Hook
+`everfresh/alert` to a webhook / IFTTT / email so you're notified the moment a
+sensor drops out or it overheats — these fire on the *transition*, not on a timer.
+
+### Manual override functions (testing & maintenance)
+
+Force an actuator for a bounded window; it auto-reverts to automatic control when
+the window expires (default 60 s, hard-capped at 600 s). Call from CLI or the app:
+
+```bash
+particle call <device-name> runFogger "30"     # fogger ON for 30 s
+particle call <device-name> runHeater "20"     # heater ON for 20 s (overheat cutoff still applies)
+particle call <device-name> setFan "80,120"    # fan to 80% for 120 s  (or just "80" for default window)
+particle call <device-name> clearOverrides ""  # cancel all overrides now, back to auto
+```
+
+While any override is active, `mode` reads `manual`. Safety always wins: the
+overheat cutoff and the no-valid-sensor lockout still force the heater off
+regardless of an override (the one exception: a manual `runHeater` is allowed to
+fire with no sensor present, for bench-testing the SSR — but overheat still kills
+it if a sensor *is* reading hot).
 
 ---
 

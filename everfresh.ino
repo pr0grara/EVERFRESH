@@ -69,6 +69,12 @@ const unsigned long FOG_MIN_OFF   = 20000;  // 20s
 const unsigned long CONTROL_INTERVAL = 3000;    // run control every 3s
 const unsigned long PUBLISH_INTERVAL = 60000;   // cloud publish every 60s
 
+// --- Manual override (testing / maintenance) ---
+// Cloud functions force an actuator for a bounded window, then it auto-reverts
+// to normal control. Keeps a forgotten override from running forever.
+const unsigned long OVERRIDE_DEFAULT_S = 60;    // pulse length if none specified
+const unsigned long OVERRIDE_MAX_S     = 600;   // hard cap on any override (10 min)
+
 // ====================================================================
 
 // I2C addresses (ADDR pin: low = 0x44, high = 0x45)
@@ -92,10 +98,18 @@ unsigned long lastControl = 0, lastPublish = 0;
 
 int fanCurrentDuty = FAN_MIN_DUTY;
 
+// Manual-override state. While *Until is in the future, that actuator is forced.
+unsigned long heatOverrideUntil = 0; bool heatOverrideOn  = false;
+unsigned long fogOverrideUntil  = 0; bool fogOverrideOn   = false;
+unsigned long fanOverrideUntil  = 0; int  fanOverrideDuty = FAN_MIN_DUTY;
+
 // Cloud-exposed strings/numbers (Particle dashboard)
 double cloudCanopyT = 0, cloudCanopyRH = 0, cloudTrunkT = 0, cloudTrunkRH = 0;
 double cloudFanDuty = 0;
+int    cloudHeat = 0, cloudFog = 0;       // actuator states (0/1) for dashboards
+char   cloudMode[16]   = "auto";          // "auto" or "manual"
 char   cloudStatus[160] = "boot";
+char   lastAlert[40]   = "";              // de-dupes event-driven alerts
 
 // Application watchdog: if the loop hangs >60s, reset the device.
 ApplicationWatchdog *wd;
@@ -237,64 +251,161 @@ int fanDuty() {
 }
 
 void control() {
-  // ---- SAFETY FIRST ----
-  // No trustworthy temperature => kill heat and fog. Never heat blind.
-  if (!sensorsValid) {
-    heatOn = applyHysteresis(heatOn, false, heatLastChange, 0, 0);
-    fogOn  = applyHysteresis(fogOn,  false, fogLastChange,  0, 0);
-    writeRelay(PIN_HEAT, false);
-    writeRelay(PIN_FOG,  false);
-    writeFan(FAN_MIN_DUTY);   // keep baseline airflow even when blind
-    strcpy(cloudStatus, "ALARM: no valid sensor — heat/fog OFF");
-    return;
+  unsigned long now = millis();
+  bool overheat = sensorsValid && (hottestReading() >= TEMP_SAFETY_F);
+
+  // ===== 1) AUTOMATIC decisions =====
+  bool autoHeat = false, autoFog = false;
+  int  autoFan  = FAN_MIN_DUTY;
+
+  if (sensorsValid) {
+    // HEAT demand (hysteresis around HEAT_ON/HEAT_OFF).
+    if (overheat)                               autoHeat = false;
+    else if (!heatOn && ctrlTempF < HEAT_ON_F)  autoHeat = true;
+    else if (heatOn  && ctrlTempF > HEAT_OFF_F) autoHeat = false;
+    else                                        autoHeat = heatOn;   // hold in deadband
+
+    // FOG demand: humidity OR cooling, capped by the humidity ceiling.
+    bool wantHumidity;
+    if (!fogOn && ctrlRH < RH_FOG_ON)       wantHumidity = true;
+    else if (fogOn && ctrlRH > RH_FOG_OFF)  wantHumidity = false;
+    else                                    wantHumidity = fogOn;
+
+    bool wantCooling;
+    if (ctrlTempF > COOL_ON_F)       wantCooling = true;
+    else if (ctrlTempF < COOL_OFF_F) wantCooling = false;
+    else                             wantCooling = fogOn;
+
+    autoFog = (wantHumidity || wantCooling);
+    if (ctrlRH >= RH_CEILING) autoFog = false;   // never push RH out the top
+
+    autoFan = fanDuty();
   }
 
-  // Hard thermal cutoff regardless of control point.
-  bool overheat = hottestReading() >= TEMP_SAFETY_F;
+  // ===== 2) MANUAL OVERRIDE layer (testing / maintenance) =====
+  // Active overrides replace the automatic request and respond immediately
+  // (bypassing the min on/off timers). They expire on their own.
+  bool heatReq = autoHeat, fogReq = autoFog;
+  int  fanReq  = autoFan;
+  bool heatManual = (now < heatOverrideUntil);
+  bool fogManual  = (now < fogOverrideUntil);
+  bool fanManual  = (now < fanOverrideUntil);
 
-  // ---- HEAT demand (hysteresis around HEAT_ON/HEAT_OFF) ----
-  bool wantHeat;
-  if (overheat)               wantHeat = false;
-  else if (!heatOn && ctrlTempF < HEAT_ON_F)  wantHeat = true;
-  else if (heatOn  && ctrlTempF > HEAT_OFF_F) wantHeat = false;
-  else                        wantHeat = heatOn;     // inside deadband: hold
+  if (heatManual) heatReq = heatOverrideOn;
+  if (fogManual)  fogReq  = fogOverrideOn;
+  if (fanManual)  fanReq  = fanOverrideDuty;
+  bool anyManual = heatManual || fogManual || fanManual;
+  strcpy(cloudMode, anyManual ? "manual" : "auto");
 
-  // ---- FOG demand: dual purpose (humidity OR cooling) ----
-  // Reason A: humidity too low.
-  bool wantHumidity;
-  if (!fogOn && ctrlRH < RH_FOG_ON)  wantHumidity = true;
-  else if (fogOn && ctrlRH > RH_FOG_OFF) wantHumidity = false;
-  else wantHumidity = fogOn;
+  // ===== 3) HARD SAFETY — always wins, even over a manual override =====
+  if (overheat) heatReq = false;                       // never heat while overheating
+  // Heating requires a valid temperature, UNLESS explicitly forced for bench
+  // testing (heatManual). Even then the overheat cutoff above still applies.
+  if (!sensorsValid && !heatManual) heatReq = false;
 
-  // Reason B: too hot AND we have humidity headroom (evaporative cooling).
-  bool wantCooling;
-  if (ctrlTempF > COOL_ON_F)       wantCooling = true;
-  else if (ctrlTempF < COOL_OFF_F) wantCooling = false;
-  else                             wantCooling = fogOn;
+  // ===== 4) apply outputs =====
+  // Manual requests are immediate; automatic requests respect equipment timers.
+  if (heatManual) { heatOn = heatReq; heatLastChange = now; }
+  else            heatOn = applyHysteresis(heatOn, heatReq, heatLastChange, HEAT_MIN_ON, HEAT_MIN_OFF);
 
-  bool wantFog = (wantHumidity || wantCooling);
-  // Hard humidity ceiling: never push RH out the top, even to cool.
-  if (ctrlRH >= RH_CEILING) wantFog = false;
-
-  // ---- apply with timing protection ----
-  heatOn = applyHysteresis(heatOn, wantHeat, heatLastChange, HEAT_MIN_ON, HEAT_MIN_OFF);
-  fogOn  = applyHysteresis(fogOn,  wantFog,  fogLastChange,  FOG_MIN_ON,  FOG_MIN_OFF);
-
-  int duty = fanDuty();
+  if (fogManual)  { fogOn = fogReq; fogLastChange = now; }
+  else            fogOn  = applyHysteresis(fogOn,  fogReq,  fogLastChange,  FOG_MIN_ON,  FOG_MIN_OFF);
 
   writeRelay(PIN_HEAT, heatOn);
   writeRelay(PIN_FOG,  fogOn);
-  writeFan(duty);
+  writeFan(fanReq);
 
-  // ---- status string for the cloud ----
-  snprintf(cloudStatus, sizeof(cloudStatus),
-           "T=%.1fF RH=%.0f%% | heat=%s fog=%s fan=%d%%%s%s",
-           ctrlTempF, ctrlRH,
-           heatOn ? "ON" : "off",
-           fogOn  ? "ON" : "off",
-           duty,
-           overheat ? " [OVERHEAT]" : "",
-           (ctrlRH >= RH_CEILING) ? " [RH-ceiling]" : "");
+  // mirror actuator state to the cloud
+  cloudHeat = heatOn ? 1 : 0;
+  cloudFog  = fogOn  ? 1 : 0;
+
+  // ===== 5) human-readable status string =====
+  if (!sensorsValid) {
+    snprintf(cloudStatus, sizeof(cloudStatus),
+             "ALARM no-sensor | heat=%s fog=%s fan=%d%% [%s]",
+             heatOn ? "ON" : "off", fogOn ? "ON" : "off", fanReq, cloudMode);
+  } else {
+    snprintf(cloudStatus, sizeof(cloudStatus),
+             "T=%.1fF RH=%.0f%% | heat=%s fog=%s fan=%d%% [%s]%s%s",
+             ctrlTempF, ctrlRH,
+             heatOn ? "ON" : "off", fogOn ? "ON" : "off", fanReq, cloudMode,
+             overheat ? " OVERHEAT" : "",
+             (ctrlRH >= RH_CEILING) ? " RH-ceiling" : "");
+  }
+}
+
+// -------------------- cloud functions (manual override) --------------------
+
+// Clamp a requested duration: blank/<=0 => default, and never exceed the cap.
+unsigned long clampSeconds(String arg) {
+  long s = arg.trim().length() ? arg.toInt() : 0;
+  if (s <= 0) s = OVERRIDE_DEFAULT_S;
+  if ((unsigned long)s > OVERRIDE_MAX_S) s = OVERRIDE_MAX_S;
+  return (unsigned long)s;
+}
+
+// runFogger("30")  -> force the fogger ON for 30s (default if blank), then revert.
+int fnRunFogger(String arg) {
+  unsigned long s = clampSeconds(arg);
+  fogOverrideOn = true;
+  fogOverrideUntil = millis() + s * 1000;
+  Particle.publish("everfresh/cmd", String::format("fogger %lus", s), PRIVATE);
+  return (int)s;
+}
+
+// runHeater("30")  -> force the heater ON for 30s. Still killed by overheat cutoff.
+int fnRunHeater(String arg) {
+  unsigned long s = clampSeconds(arg);
+  heatOverrideOn = true;
+  heatOverrideUntil = millis() + s * 1000;
+  Particle.publish("everfresh/cmd", String::format("heater %lus", s), PRIVATE);
+  return (int)s;
+}
+
+// setFan("80")  or  setFan("80,120")  -> hold 80% for 120s (default window if omitted).
+int fnSetFan(String arg) {
+  int comma = arg.indexOf(',');
+  int duty = (comma >= 0 ? arg.substring(0, comma) : arg).toInt();
+  if (duty < 0) duty = 0;
+  if (duty > 100) duty = 100;
+  unsigned long s = clampSeconds(comma >= 0 ? arg.substring(comma + 1) : "");
+  fanOverrideDuty = duty;
+  fanOverrideUntil = millis() + s * 1000;
+  Particle.publish("everfresh/cmd", String::format("fan %d%% %lus", duty, s), PRIVATE);
+  return duty;
+}
+
+// clearOverrides("") -> cancel all manual overrides immediately, return to auto.
+int fnClearOverrides(String arg) {
+  heatOverrideUntil = fogOverrideUntil = fanOverrideUntil = 0;
+  Particle.publish("everfresh/cmd", "cleared", PRIVATE);
+  return 0;
+}
+
+// -------------------- telemetry --------------------
+
+// Compact JSON for logging/webhooks. Stays well under the 255-byte event limit.
+void publishTelemetry() {
+  char json[255];
+  snprintf(json, sizeof(json),
+    "{\"ct\":%.1f,\"crh\":%.0f,\"tt\":%.1f,\"trh\":%.0f,"
+    "\"heat\":%d,\"fog\":%d,\"fan\":%d,\"mode\":\"%s\"}",
+    cloudCanopyT, cloudCanopyRH, cloudTrunkT, cloudTrunkRH,
+    cloudHeat, cloudFog, fanCurrentDuty, cloudMode);
+  Particle.publish("everfresh/telemetry", json, PRIVATE);
+}
+
+// Fire an alert event only when the alert state CHANGES (not every loop).
+void publishAlerts() {
+  const char *alert = "";
+  if (!sensorsValid)                                    alert = "no-sensor";
+  else if (hottestReading() >= TEMP_SAFETY_F)           alert = "overheat";
+
+  if (strcmp(alert, lastAlert) != 0) {
+    strncpy(lastAlert, alert, sizeof(lastAlert) - 1);
+    if (alert[0]) Particle.publish("everfresh/alert", alert, PRIVATE);
+    else          Particle.publish("everfresh/alert", "cleared", PRIVATE);
+  }
 }
 
 // -------------------- setup / loop --------------------
@@ -322,7 +433,16 @@ void setup() {
   Particle.variable("trunkTempF",  cloudTrunkT);
   Particle.variable("trunkRH",     cloudTrunkRH);
   Particle.variable("fanDuty",     cloudFanDuty);
+  Particle.variable("heat",        cloudHeat);
+  Particle.variable("fog",         cloudFog);
+  Particle.variable("mode",        cloudMode);
   Particle.variable("status",      cloudStatus);
+
+  // Manual-override cloud functions (CLI: particle call <device> <fn> "<arg>")
+  Particle.function("runFogger",      fnRunFogger);      // arg: seconds
+  Particle.function("runHeater",      fnRunHeater);      // arg: seconds
+  Particle.function("setFan",         fnSetFan);         // arg: "duty" or "duty,seconds"
+  Particle.function("clearOverrides", fnClearOverrides); // arg: (ignored)
 
   // Reset the board if loop() ever stalls for 60s (hung I2C, etc.).
   wd = new ApplicationWatchdog(60000, System.reset, 1536);
@@ -339,12 +459,12 @@ void loop() {
     lastControl = now;
     readSensors();
     control();
+    publishAlerts();   // event-driven: fires only when alert state changes
   }
 
   if (now - lastPublish >= PUBLISH_INTERVAL) {
     lastPublish = now;
-    // Publish a compact event for logging / alerts / IFTTT / webhooks.
-    Particle.publish("everfresh", cloudStatus, PRIVATE);
+    publishTelemetry();   // periodic JSON snapshot for logging / webhooks
   }
 
   if (wd) wd->checkin();   // pet the watchdog

@@ -174,22 +174,38 @@ hard cutoff (`TEMP_SAFETY_F = 92 °F`) kills it if either sensor reads too hot.
 
 ---
 
-## Bench-testing tip: setpoint gaming vs. manual override
+## Bench-testing with manual override functions
 
-During wiring you'll want to force actuators on/off without fooling a sensor or
-constantly editing setpoints. Two options:
+You don't need to fool a sensor or edit setpoints to test an actuator. The
+firmware exposes cloud functions that force an actuator for a bounded window, then
+auto-revert to automatic control (default 60 s, capped at 600 s):
 
-1. **Temporarily edit setpoints** in the config and reflash (simple, but slow).
-2. **Manual override cloud function** (if added to the firmware): toggle any
-   actuator from CLI/phone with an auto-expiring timeout that reverts to automatic
-   control. e.g. `particle call <device-name> set "heat=on"`.
+```bash
+particle call <device-name> runFogger "30"     # fogger ON for 30 s
+particle call <device-name> runHeater "20"     # heater ON for 20 s
+particle call <device-name> setFan "80,120"    # fan to 80% for 120 s
+particle call <device-name> clearOverrides ""  # cancel everything, back to auto
+```
 
-If the override function isn't in your build yet, ask to have it added — it makes
-this whole bring-up phase much faster and is worth keeping for future maintenance.
+These are perfect for each bring-up step: `setFan "100"` to confirm the fan
+circuit, `runFogger "10"` to confirm the fogger MOSFET, `runHeater "10"` to watch
+the SSR's DC side toggle in Step 4a. Watch the result on `status` or `mode`:
+
+```bash
+particle get <device-name> mode      # reads "manual" while an override is active
+particle get <device-name> status
+```
+
+**Safety still applies during overrides:** the overheat cutoff and the
+no-valid-sensor lockout will still force the heater off. The one exception —
+`runHeater` is allowed to fire even with no sensor wired, specifically so you can
+bench-test the SSR in Step 4a — but if a sensor *is* reading hot, overheat wins.
 
 ---
 
-## Quick reference — cloud variables
+## Quick reference
+
+### Cloud variables (`particle get <device-name> <variable>`)
 
 | Variable      | Meaning                                   |
 |---------------|-------------------------------------------|
@@ -199,11 +215,25 @@ this whole bring-up phase much faster and is worth keeping for future maintenanc
 | `trunkTempF`  | Trunk temperature °F                      |
 | `trunkRH`     | Trunk humidity %                          |
 | `fanDuty`     | Current airflow fan speed %               |
+| `heat` / `fog`| Actuator state (0/1)                      |
+| `mode`        | `auto` or `manual` (override active)      |
 
-```bash
-particle get <device-name> <variable>
-particle monitor <device-name> status        # poll continuously (CLI helper)
-```
+### Cloud functions (`particle call <device-name> <fn> "<arg>"`)
+
+| Function          | Arg               | Effect                                  |
+|-------------------|-------------------|-----------------------------------------|
+| `runFogger`       | seconds           | Force fogger ON for N s                  |
+| `runHeater`       | seconds           | Force heater ON for N s                  |
+| `setFan`          | `duty` / `duty,s` | Hold fan at duty% for N s               |
+| `clearOverrides`  | (ignored)         | Cancel all overrides, return to auto    |
+
+### Events (subscribe / webhook on these)
+
+| Event                 | When                            |
+|-----------------------|---------------------------------|
+| `everfresh/telemetry` | every 60 s — JSON snapshot      |
+| `everfresh/alert`     | on alert state change           |
+| `everfresh/cmd`       | on manual override              |
 
 ---
 
