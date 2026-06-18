@@ -36,7 +36,8 @@ ALARM: no valid sensor — heat/fog OFF
 ```
 
 This is **correct and expected**. Both SHT31 reads fail, `sensorsValid` goes
-false, and the safety path fires — heater and fogger forced off, fan at baseline.
+false, and the safety path fires — heater and fogger forced off, fan on its
+hourly-minimum ventilation only.
 Seeing this confirms the control loop, cloud variables, and fail-safe logic all
 work *before any hardware exists*.
 
@@ -46,10 +47,10 @@ cyan; re-run `particle setup` / Wi-Fi credentials if not).
 
 ---
 
-## Step 1 — Sensors (3.3 V, I²C — safe on the breadboard)
+## Step 1 — Sensor (3.3 V, I²C — safe on the breadboard)
 
-The sensors are the only subsystem that belongs on a breadboard long-term.
-Bring up **one sensor first.**
+The single canopy SHT31 is the only subsystem that belongs on a breadboard
+long-term.
 
 ### Wire the canopy sensor (0x44)
 
@@ -68,27 +69,19 @@ SCL→3V3 (most breakouts already include them).
 
 ```bash
 particle get <device-name> canopyTempF    # should read room temp in °F
-particle get <device-name> status         # ALARM gone; shows T=..F RH=..% fan=50%
+particle get <device-name> status         # ALARM gone; shows T=..F RH=..% fan=0% (off below 77F)
 ```
 
 Breathe on the sensor — RH should jump within a few seconds.
 
-### Add the trunk sensor (0x45)
-
-Identical wiring, but **`ADDR → 3V3`** (= `0x45`). Both share the same SDA/SCL bus.
-
-```bash
-particle get <device-name> trunkTempF      # should read room temp
-```
-
-✅ **Pass:** both `canopyTempF` and `trunkTempF` read plausible room temperature.
-❌ **A sensor reads `-1`:** it's failing to ack or failing CRC. Usual causes:
-wiring, wrong/duplicate ADDR strap (two sensors on the same address collide), or
-missing pull-ups.
+✅ **Pass:** `canopyTempF` reads plausible room temperature and `status` no longer
+shows `ALARM`.
+❌ **`canopyTempF` reads `-1`:** the sensor is failing to ack or failing CRC. Usual
+causes: wiring, the ADDR pin not strapped low (must be `0x44`), or missing pull-ups.
 
 ---
 
-## Step 2 — Airflow fan (12 V, variable speed via MOSFET)
+## Step 2 — Airflow fan (12 V, ON/OFF via MOSFET)
 
 Build the **low-side MOSFET circuit** from [README.md](README.md#2-wire-dc-fan--fogger-low-side-mosfet--pwm),
 driven from **`A5`**.
@@ -106,18 +99,22 @@ Critical wiring rules:
 
 ### Verify
 
-- On boot/reset you'll see the **800 ms full-speed kick**, then it settles to
-  `FAN_MIN_DUTY` (50 %).
-- To watch it ramp: lightly cover or breathe on the canopy sensor to push RH
-  above 65 %, and confirm the fan speeds up:
+The fan is ON/OFF for now (runs at full 12 V). The simplest test is to force it:
 
 ```bash
-particle get <device-name> fanDuty          # climbs toward 100 as RH rises
+particle call <device-name> setFan "100"    # fan ON
+particle get  <device-name> fanDuty          # reads 100
+particle call <device-name> setFan "0"       # fan OFF
+particle call <device-name> clearOverrides "" # back to auto (temp-driven)
 ```
 
-✅ **Pass:** fan spins at baseline, kicks on boot, and `fanDuty` tracks RH.
-❌ **Fan won't start at baseline:** raise `FAN_MIN_DUTY` (stiction); confirm the
-MOSFET is logic-level and grounds are common.
+In automatic mode it turns on when the canopy is above 77 °F, and is forced on for
+≥ 5 minutes each hour regardless of temp — so even in a cool room you'll see it run
+a few minutes at the top of the hour.
+
+✅ **Pass:** fan runs full-speed on `setFan "100"` and stops on `"0"`.
+❌ **Fan won't spin at all:** confirm the MOSFET is logic-level, grounds are common,
+and the PWM frequency is under the board's ceiling (`FAN_PWM_FREQ`).
 
 ---
 
@@ -170,7 +167,7 @@ Restore `HEAT_ON_F` to `76.0` afterward.
 - Heat-sink the SSR if it runs near its current rating.
 
 ✅ **Pass:** heater energizes on a heat call and de-energizes when satisfied; the
-hard cutoff (`TEMP_SAFETY_F = 92 °F`) kills it if either sensor reads too hot.
+hard cutoff (`TEMP_SAFETY_F = 92 °F`) kills it if the sensor reads too hot.
 
 ---
 
@@ -212,8 +209,6 @@ bench-test the SSR in Step 4a — but if a sensor *is* reading hot, overheat win
 | `status`      | One-line summary string                   |
 | `canopyTempF` | Canopy temperature °F (`-1` = invalid)    |
 | `canopyRH`    | Canopy humidity % (`-1` = invalid)        |
-| `trunkTempF`  | Trunk temperature °F                      |
-| `trunkRH`     | Trunk humidity %                          |
 | `fanDuty`     | Current airflow fan speed %               |
 | `heat` / `fog`| Actuator state (0/1)                      |
 | `mode`        | `auto` or `manual` (override active)      |
@@ -241,8 +236,7 @@ bench-test the SSR in Step 4a — but if a sensor *is* reading hot, overheat win
 
 - [ ] Step 0 — `status` shows `ALARM: no valid sensor` (firmware alive)
 - [ ] Step 1 — canopy sensor (0x44) reads room temp
-- [ ] Step 1 — trunk sensor (0x45) reads room temp
-- [ ] Step 2 — fan spins, boots with kick, `fanDuty` tracks RH
+- [ ] Step 2 — fan runs on `setFan "100"`, stops on `"0"`, auto-on above 77 °F
 - [ ] Step 3 — fogger runs on low-RH demand (water in reservoir!)
 - [ ] Step 4a — SSR DC side toggles on heat call
 - [ ] Step 4b — heater AC side switched (hot leg, enclosed)

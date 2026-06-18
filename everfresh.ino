@@ -2,11 +2,12 @@
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
  * Target: Particle Photon 2  (also compiles on original Photon / Argon)
  *
- * Sensors : 2x SHT31 over I2C   (canopy @ 0x44, trunk @ 0x45)
+ * Sensors : 1x SHT31 over I2C at the canopy (@ 0x44)
  * Actuators:
  *   HEAT  — 120VAC aquarium heater OR heat mat, via SSR/relay
  *   FOG   — 12VDC ultrasonic fogger + mist fan combo (does humidity AND cooling)
- *   CIRC  — 12VDC airflow fan @ 6V, runs 24/7 (MCU control optional)
+ *   CIRC  — 12VDC airflow fan; ON/OFF by temperature + min 5 min/hour
+ *           (PWM variable-speed returns when the 4-wire fan is installed)
  *
  * Control strategy: hysteresis (deadband) bang-bang control with
  * minimum on/off timers to protect equipment and stop relay chatter.
@@ -14,7 +15,7 @@
  * COOLING are arbitrated against a hard humidity ceiling.
  *
  * SAFETY: the heater is NEVER energized without a valid temperature
- * reading, and is force-OFF if either sensor reads dangerously hot.
+ * reading, and is force-OFF if the sensor reads dangerously hot.
  */
 
 #include <math.h>   // NAN, isnan(), fabs()
@@ -33,31 +34,33 @@ const bool RELAY_ACTIVE_LOW = false;   // false = active-HIGH (SSR/MOSFET)
 const int PIN_HEAT = D2;   // 120VAC heater  (USE AN SSR — relays wear out fast)
 const int PIN_FOG  = D3;   // 12VDC fogger + mist fan combo
 
-// --- Airflow fan: VARIABLE SPEED via PWM ---
-// PIN_CIRC must be a PWM-capable pin on YOUR board (original Photon: A4/A5/WKP/D0-D3;
-// Photon 2: check the datasheet — A5 is a safe bet on both).
-// Wiring options:
-//   2-wire 12V fan  -> drive a logic-level MOSFET low-side, PWM the gate from this pin.
-//   4-wire PC fan   -> power the fan at 12V, PWM its dedicated control wire from this pin.
+// --- Airflow / ventilation fan ---
+// PIN_CIRC must be a PWM-capable pin on YOUR board (original Photon: A4/A5/WKP/D0-D3).
+// TEMPORARY (until the 4-wire fan arrives): the 2-wire fan runs as simple ON/OFF.
+// "On" = 100% duty = steady 12V, which also dodges the BLDC brownout that low-duty
+// PWM causes on this fan. Variable-speed PWM returns once the 4-wire fan is wired.
 const int PIN_CIRC      = A5;
-const int FAN_PWM_FREQ  = 25000;  // 25kHz: above hearing range, no audible fan whine
-// Duty is % of supply voltage. From a 12V supply: ~50% ≈ 6V average (your current baseline).
-// Tune FAN_MIN_DUTY until the fan reliably spins and matches your "min viable" airflow.
-const int FAN_MIN_DUTY  = 50;     // % — always-on baseline (never drops below this)
-const int FAN_MAX_DUTY  = 100;    // % — full speed for venting / destratifying
-const float DESTRAT_GAP_F = 4.0;  // canopy/trunk temp gap that triggers a mixing boost
+const int FAN_PWM_FREQ  = 18000;  // only matters once variable-speed PWM returns (4-wire)
+const int FAN_ON_DUTY   = 100;    // "on" level; 100% = steady (no PWM chopping)
+
+// Fan logic: run whenever canopy temp is above FAN_ON_F (with a deadband), AND
+// guarantee a minimum run time every hour for air exchange regardless of temp.
+const float FAN_ON_F  = 77.0;     // fan turns ON above this temperature
+const float FAN_OFF_F = 76.0;     // fan turns OFF below this (hysteresis deadband)
+const unsigned long FAN_MIN_MS_PER_HOUR = 5UL * 60 * 1000;   // >= 5 min ventilation / hour
+const unsigned long FAN_WINDOW_MS       = 60UL * 60 * 1000;  // rolling 1-hour window
 
 // --- Setpoints (degrees F) ---  target band: 75–85F
 const float HEAT_ON_F   = 76.0;   // heater turns ON below this
 const float HEAT_OFF_F  = 78.5;   // heater turns OFF above this  (hysteresis)
 const float COOL_ON_F   = 84.0;   // fog-for-cooling turns ON above this
 const float COOL_OFF_F  = 82.0;   // fog-for-cooling turns OFF below this
-const float TEMP_SAFETY_F = 92.0; // ANY sensor above this => heater hard OFF
+const float TEMP_SAFETY_F = 92.0; // sensor above this => heater hard OFF
 
 // --- Setpoints (percent RH) ---  target band: 50–80%
 const float RH_FOG_ON   = 55.0;   // fog-for-humidity turns ON below this
-const float RH_FOG_OFF  = 65.0;   // fog-for-humidity turns OFF above this
-const float RH_CEILING  = 78.0;   // NEVER fog above this, even to cool
+const float RH_FOG_OFF  = 75.0;   // fog-for-humidity turns OFF above this
+const float RH_CEILING  = 90.0;   // NEVER fog above this, even to cool
 
 // --- Minimum on/off times (ms) — protect gear, stop chatter ---
 const unsigned long HEAT_MIN_ON   = 60000;  // 60s
@@ -77,14 +80,12 @@ const unsigned long OVERRIDE_MAX_S     = 600;   // hard cap on any override (10 
 
 // ====================================================================
 
-// I2C addresses (ADDR pin: low = 0x44, high = 0x45)
+// I2C address of the canopy SHT31 (ADDR pin tied low = 0x44)
 const uint8_t ADDR_CANOPY = 0x44;
-const uint8_t ADDR_TRUNK  = 0x45;
 
 // Sensor state
 struct Reading { float tempF; float rh; bool ok; };
 Reading canopy = {NAN, NAN, false};
-Reading trunk  = {NAN, NAN, false};
 
 // Control-point values actually used for decisions
 float ctrlTempF = NAN;
@@ -96,20 +97,31 @@ bool heatOn = false, fogOn = false;
 unsigned long heatLastChange = 0, fogLastChange = 0;
 unsigned long lastControl = 0, lastPublish = 0;
 
-int fanCurrentDuty = FAN_MIN_DUTY;
+int fanCurrentDuty = 0;
+
+// Ventilation fan state + hourly minimum-runtime accounting.
+bool fanOn = false;                  // auto temp-hysteresis state
+bool fanRunning = false;             // actual applied state (incl. manual override)
+unsigned long fanHourStart = 0;      // start of the current 1-hour window
+unsigned long fanOnMsThisHour = 0;   // run time accumulated this window
+unsigned long fanLastTick = 0;       // timestamp for accumulating run time
 
 // Manual-override state. While *Until is in the future, that actuator is forced.
 unsigned long heatOverrideUntil = 0; bool heatOverrideOn  = false;
 unsigned long fogOverrideUntil  = 0; bool fogOverrideOn   = false;
-unsigned long fanOverrideUntil  = 0; int  fanOverrideDuty = FAN_MIN_DUTY;
+unsigned long fanOverrideUntil  = 0; int  fanOverrideDuty = 0;
 
 // Cloud-exposed strings/numbers (Particle dashboard)
-double cloudCanopyT = 0, cloudCanopyRH = 0, cloudTrunkT = 0, cloudTrunkRH = 0;
+double cloudCanopyT = 0, cloudCanopyRH = 0;
 double cloudFanDuty = 0;
 int    cloudHeat = 0, cloudFog = 0;       // actuator states (0/1) for dashboards
 char   cloudMode[16]   = "auto";          // "auto" or "manual"
 char   cloudStatus[160] = "boot";
 char   lastAlert[40]   = "";              // de-dupes event-driven alerts
+
+// Previous actuator states, for emitting an event only when one toggles.
+bool prevHeat = false, prevFog = false, prevVent = false;
+bool stateInit = false;                   // skip the very first comparison
 
 // Application watchdog: if the loop hangs >60s, reset the device.
 ApplicationWatchdog *wd;
@@ -125,7 +137,7 @@ void writeRelay(int pin, bool on) {
 }
 
 void writeFan(int dutyPct) {
-  // Map 0–100% to the Photon's 8-bit PWM range at an inaudible frequency.
+  // Direct mapping: duty % == fraction of supply voltage (0% = 0V, 100% ≈ 12V).
   if (dutyPct < 0)   dutyPct = 0;
   if (dutyPct > 100) dutyPct = 100;
   fanCurrentDuty = dutyPct;
@@ -181,31 +193,16 @@ bool sht31Read(uint8_t addr, float &tempC, float &rh) {
 
 void readSensors() {
   float c, h;
-
   if (sht31Read(ADDR_CANOPY, c, h)) { float f = cToF(c); canopy = { f, h, valid(f, h) }; }
   else                              { canopy = { NAN, NAN, false }; }
 
-  if (sht31Read(ADDR_TRUNK, c, h))  { float f = cToF(c); trunk = { f, h, valid(f, h) }; }
-  else                              { trunk = { NAN, NAN, false }; }
+  // Single sensor: it's the control point and the only thing we know.
+  if (canopy.ok) { ctrlTempF = canopy.tempF; ctrlRH = canopy.rh; sensorsValid = true; }
+  else           { sensorsValid = false; }
 
-  // Control point: prefer canopy (where leaves transpire); fall back to trunk.
-  if (canopy.ok)      { ctrlTempF = canopy.tempF; ctrlRH = canopy.rh; sensorsValid = true; }
-  else if (trunk.ok)  { ctrlTempF = trunk.tempF;  ctrlRH = trunk.rh;  sensorsValid = true; }
-  else                { sensorsValid = false; }
-
-  // mirror to cloud variables
+  // mirror to cloud variables (-1 = currently invalid)
   cloudCanopyT  = canopy.ok ? canopy.tempF : -1;
   cloudCanopyRH = canopy.ok ? canopy.rh    : -1;
-  cloudTrunkT   = trunk.ok  ? trunk.tempF  : -1;
-  cloudTrunkRH  = trunk.ok  ? trunk.rh     : -1;
-}
-
-// Highest valid temp across both sensors — used for safety cutoff.
-float hottestReading() {
-  float h = -1000;
-  if (canopy.ok && canopy.tempF > h) h = canopy.tempF;
-  if (trunk.ok  && trunk.tempF  > h) h = trunk.tempF;
-  return h;
 }
 
 // -------------------- control --------------------
@@ -222,41 +219,43 @@ bool applyHysteresis(bool current, bool wantOn,
   return wantOn;
 }
 
-// Desired airflow fan speed (%). Baseline always-on, ramped up when the air
-// needs to move — this fan is our ONLY active lever to shed excess humidity.
-int fanDuty() {
-  if (!sensorsValid) return FAN_MIN_DUTY;     // benign: keep air moving
+// Ventilation fan: ON above FAN_ON_F (with a deadband down to FAN_OFF_F), plus a
+// guaranteed minimum run time per rolling hour. Returns the "on" duty or 0.
+// (Hourly accounting is updated separately in control() from the ACTUAL fan state,
+// so manual-override run time counts toward the minimum too.)
+int autoVentDuty(unsigned long now) {
+  // Temperature demand, with hysteresis to prevent chatter near the threshold.
+  bool tempDemand;
+  if (!sensorsValid)                          tempDemand = false;  // no temp -> rule off
+  else if (!fanOn && ctrlTempF >= FAN_ON_F)   tempDemand = true;
+  else if (fanOn  && ctrlTempF <= FAN_OFF_F)  tempDemand = false;
+  else                                        tempDemand = fanOn;  // hold in deadband
 
-  int duty = FAN_MIN_DUTY;
+  // Hourly minimum: if the time left in the window is only just enough to cover
+  // the remaining run-time deficit, force the fan on to make it up before the
+  // window resets. With no temp demand this naturally runs the 5 min at hour's end.
+  unsigned long elapsed   = now - fanHourStart;
+  unsigned long remaining = (elapsed < FAN_WINDOW_MS) ? (FAN_WINDOW_MS - elapsed) : 0;
+  unsigned long deficit   = (fanOnMsThisHour < FAN_MIN_MS_PER_HOUR)
+                            ? (FAN_MIN_MS_PER_HOUR - fanOnMsThisHour) : 0;
+  bool makeup = (deficit > 0 && remaining <= deficit);
 
-  // 1) Vent excess humidity. Ramp linearly from baseline (at RH_FOG_OFF, where
-  //    we stop adding moisture) up to full speed at the RH ceiling. Below
-  //    RH_FOG_OFF we leave it at baseline so we don't blow away humidity we want.
-  if (ctrlRH > RH_FOG_OFF) {
-    float frac = (ctrlRH - RH_FOG_OFF) / (RH_CEILING - RH_FOG_OFF);   // 0..1
-    if (frac > 1.0) frac = 1.0;
-    int ventDuty = FAN_MIN_DUTY + (int)(frac * (FAN_MAX_DUTY - FAN_MIN_DUTY));
-    if (ventDuty > duty) duty = ventDuty;
-  }
-
-  // 2) Hot AND too humid to fog: the fan is the only cooling/venting tool left.
-  if (ctrlTempF > COOL_ON_F && ctrlRH >= RH_CEILING) duty = FAN_MAX_DUTY;
-
-  // 3) Destratify: large canopy/trunk temperature gap => bump airflow to mix.
-  if (canopy.ok && trunk.ok && fabs(canopy.tempF - trunk.tempF) > DESTRAT_GAP_F) {
-    if (duty < 70) duty = 70;
-  }
-
-  return duty;
+  fanOn = tempDemand || makeup;        // remember for next tick's hysteresis
+  return fanOn ? FAN_ON_DUTY : 0;
 }
 
 void control() {
   unsigned long now = millis();
-  bool overheat = sensorsValid && (hottestReading() >= TEMP_SAFETY_F);
+  bool overheat = sensorsValid && (ctrlTempF >= TEMP_SAFETY_F);
+
+  // Ventilation fan hourly run-time accounting — count the ACTUAL run time since
+  // last tick (includes manual overrides), and reset the window every hour.
+  fanOnMsThisHour += fanRunning ? (now - fanLastTick) : 0;
+  fanLastTick = now;
+  if (now - fanHourStart >= FAN_WINDOW_MS) { fanHourStart = now; fanOnMsThisHour = 0; }
 
   // ===== 1) AUTOMATIC decisions =====
   bool autoHeat = false, autoFog = false;
-  int  autoFan  = FAN_MIN_DUTY;
 
   if (sensorsValid) {
     // HEAT demand (hysteresis around HEAT_ON/HEAT_OFF).
@@ -278,9 +277,11 @@ void control() {
 
     autoFog = (wantHumidity || wantCooling);
     if (ctrlRH >= RH_CEILING) autoFog = false;   // never push RH out the top
-
-    autoFan = fanDuty();
   }
+
+  // Ventilation fan runs even without a valid sensor (the hourly minimum still
+  // applies; the temperature rule is simply disabled when we have no reading).
+  int autoFan = autoVentDuty(now);
 
   // ===== 2) MANUAL OVERRIDE layer (testing / maintenance) =====
   // Active overrides replace the automatic request and respond immediately
@@ -314,6 +315,7 @@ void control() {
   writeRelay(PIN_HEAT, heatOn);
   writeRelay(PIN_FOG,  fogOn);
   writeFan(fanReq);
+  fanRunning = (fanReq > 0);   // actual state, for next tick's hourly accounting
 
   // mirror actuator state to the cloud
   cloudHeat = heatOn ? 1 : 0;
@@ -388,9 +390,9 @@ int fnClearOverrides(String arg) {
 void publishTelemetry() {
   char json[255];
   snprintf(json, sizeof(json),
-    "{\"ct\":%.1f,\"crh\":%.0f,\"tt\":%.1f,\"trh\":%.0f,"
+    "{\"ct\":%.1f,\"crh\":%.0f,"
     "\"heat\":%d,\"fog\":%d,\"fan\":%d,\"mode\":\"%s\"}",
-    cloudCanopyT, cloudCanopyRH, cloudTrunkT, cloudTrunkRH,
+    cloudCanopyT, cloudCanopyRH,
     cloudHeat, cloudFog, fanCurrentDuty, cloudMode);
   Particle.publish("everfresh/telemetry", json, PRIVATE);
 }
@@ -398,14 +400,34 @@ void publishTelemetry() {
 // Fire an alert event only when the alert state CHANGES (not every loop).
 void publishAlerts() {
   const char *alert = "";
-  if (!sensorsValid)                                    alert = "no-sensor";
-  else if (hottestReading() >= TEMP_SAFETY_F)           alert = "overheat";
+  if (!sensorsValid)                          alert = "no-sensor";
+  else if (ctrlTempF >= TEMP_SAFETY_F)        alert = "overheat";
 
   if (strcmp(alert, lastAlert) != 0) {
     strncpy(lastAlert, alert, sizeof(lastAlert) - 1);
     if (alert[0]) Particle.publish("everfresh/alert", alert, PRIVATE);
     else          Particle.publish("everfresh/alert", "cleared", PRIVATE);
   }
+}
+
+// Emit an event the moment an actuator toggles, so the log captures exact on/off
+// timing (not just the 60s snapshots). Payload carries the temp/RH at that instant.
+void publishStateChange(const char *what, bool on) {
+  char ev[120];
+  snprintf(ev, sizeof(ev),
+    "{\"ev\":\"%s\",\"state\":\"%s\",\"ct\":%.1f,\"crh\":%.0f}",
+    what, on ? "on" : "off", cloudCanopyT, cloudCanopyRH);
+  Particle.publish("everfresh/event", ev, PRIVATE);
+}
+
+void publishStateChanges() {
+  if (!stateInit) {   // seed baseline on first pass; don't log a boot transition
+    prevHeat = heatOn; prevFog = fogOn; prevVent = fanRunning; stateInit = true;
+    return;
+  }
+  if (heatOn     != prevHeat) { prevHeat = heatOn;     publishStateChange("heat", heatOn); }
+  if (fogOn      != prevFog)  { prevFog  = fogOn;      publishStateChange("fog",  fogOn);  }
+  if (fanRunning != prevVent) { prevVent = fanRunning; publishStateChange("vent", fanRunning); }
 }
 
 // -------------------- setup / loop --------------------
@@ -419,19 +441,14 @@ void setup() {
   writeRelay(PIN_HEAT, false);
   writeRelay(PIN_FOG,  false);
 
-  // Circulation fan: 24/7, variable speed. Kick to full briefly so a low
-  // baseline duty doesn't leave it stalled (stiction), then drop to baseline.
-  writeFan(100);
-  delay(800);
-  writeFan(FAN_MIN_DUTY);
+  // Ventilation fan starts OFF; control() turns it on by temperature / hourly minimum.
+  writeFan(0);
 
-  Wire.begin();   // SHT31s are read directly via the inline driver — no begin() per sensor
+  Wire.begin();   // SHT31 is read directly via the inline driver — no begin() needed
 
   // Cloud monitoring (Particle console / mobile app / webhooks)
   Particle.variable("canopyTempF", cloudCanopyT);
   Particle.variable("canopyRH",    cloudCanopyRH);
-  Particle.variable("trunkTempF",  cloudTrunkT);
-  Particle.variable("trunkRH",     cloudTrunkRH);
   Particle.variable("fanDuty",     cloudFanDuty);
   Particle.variable("heat",        cloudHeat);
   Particle.variable("fog",         cloudFog);
@@ -450,6 +467,7 @@ void setup() {
   // Prime timers so min-off doesn't block the first legitimate action.
   unsigned long now = millis();
   heatLastChange = fogLastChange = now - 60000;
+  fanHourStart = fanLastTick = now;   // start the ventilation hour window
 }
 
 void loop() {
@@ -459,7 +477,8 @@ void loop() {
     lastControl = now;
     readSensors();
     control();
-    publishAlerts();   // event-driven: fires only when alert state changes
+    publishAlerts();         // event-driven: fires only when alert state changes
+    publishStateChanges();   // event-driven: heat/fog/vent on/off transitions
   }
 
   if (now - lastPublish >= PUBLISH_INTERVAL) {

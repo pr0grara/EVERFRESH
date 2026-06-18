@@ -40,13 +40,16 @@ controlled actuators plus passive airflow:
   pointing down. This single combo both **raises humidity** and provides
   **evaporative cooling**.
 - **Airflow** — a 12 VDC fan at the top of the housing creating positive
-  pressure, **variable speed** (PWM). Runs 24/7 at a baseline and ramps up when
-  the air needs to move — notably, it is the *only* active way to **lower**
-  humidity (there is no dehumidifier).
+  pressure. **Temperature-driven ON/OFF:** it runs whenever the canopy is above
+  `FAN_ON_F` (77 °F), plus a guaranteed **minimum 5 minutes per hour** for air
+  exchange regardless of temperature.
+  > *Temporary:* PWM variable-speed is bypassed while a 2-wire fan is installed
+  > (it can't be smoothly speed-controlled on its power line — see
+  > [Tuning](#tuning-guide)). "On" = steady 12 V. Variable speed returns when the
+  > 4-wire fan is wired.
 
-Two **SHT31 temp/RH sensors** read the environment: one at the **canopy**, one at
-the **trunk**. The canopy is the primary control point (where the leaves
-transpire); the trunk is a fallback and a safety input.
+A single **SHT31 temp/RH sensor** at the **canopy** (where the leaves transpire)
+reads the environment and is the control point for every decision.
 
 Control is **hysteresis (deadband) bang-bang** — appropriate because every
 actuator is on/off (the fan being the exception, with proportional speed).
@@ -64,7 +67,7 @@ actuator is on/off (the fan being the exception, with proportional speed).
 | Qty | Part                                   | Notes                                                  |
 |-----|----------------------------------------|--------------------------------------------------------|
 | 1   | Particle Photon 2                      | Original Photon also works (it's EOL — fine to reuse)  |
-| 2   | SHT31-D breakout                       | I²C; one strapped to 0x44, one to 0x45                 |
+| 1   | SHT31-D breakout                       | I²C, at the canopy, ADDR strapped low (0x44)           |
 | 1   | Solid-state relay (SSR), 3–32 VDC in   | For the 120 VAC heater. **Use an SSR, not a mechanical relay.** |
 | 2   | Logic-level N-channel MOSFET           | e.g. IRLZ44N / AOI518 — one for fogger combo, one for airflow fan |
 | 2   | Flyback/Schottky diode (1N5819)        | Across each DC fan/motor load                          |
@@ -72,7 +75,7 @@ actuator is on/off (the fan being the exception, with proportional speed).
 | 2   | Resistor ~10 kΩ                        | Gate pull-down (one per MOSFET)                        |
 | 1   | 12 VDC power supply                     | Powers fogger + both fans; size for combined current   |
 | 1   | 5 VDC / USB supply                      | Powers the Photon                                      |
-| —   | Ultrasonic fogger, heater/mat, 2× fans | Per the housing build                                  |
+| —   | Ultrasonic fogger, heater/mat, 2× fans | Per the housing build (fogger fan + airflow fan)       |
 
 > **Why an SSR for the heater?** A mechanical relay cycling a resistive heater all
 > day will pit its contacts and eventually weld or fail — the single most likely
@@ -89,23 +92,21 @@ actuator is on/off (the fan being the exception, with proportional speed).
 | `PIN_HEAT`  | `D2`       | 120 VAC heater                  | SSR (digital on/off)  |
 | `PIN_FOG`   | `D3`       | 12 VDC fogger + mist fan combo  | MOSFET (digital on/off)|
 | `PIN_CIRC`  | `A5`       | 12 VDC airflow fan              | MOSFET (**PWM**)       |
-| I²C SDA/SCL | `D0`/`D1`  | Both SHT31 sensors              | —                     |
+| I²C SDA/SCL | `D0`/`D1`  | Canopy SHT31 sensor             | —                     |
 
 > `PIN_CIRC` is on `A5` because it must be **PWM-capable**. The original Photon's
 > `D4` is *not* a PWM pin. Verify A5 supports PWM on whichever board you flash.
 
-### Sensors (I²C, 3.3 V)
+### Sensor (I²C, 3.3 V)
 
-Both SHT31s share the same two-wire bus:
+A single SHT31 at the canopy:
 
 ```
 SHT31 (canopy)  VIN→3V3  GND→GND  SDA→D0  SCL→D1   ADDR→GND  (= 0x44)
-SHT31 (trunk)   VIN→3V3  GND→GND  SDA→D0  SCL→D1   ADDR→3V3  (= 0x45)
 ```
 
-The only difference between the two is the **ADDR pin**: tie it low for 0x44,
-high for 0x45. Most breakouts have on-board pull-ups on SDA/SCL; if neither does,
-add 4.7 kΩ pull-ups to 3V3.
+Tie **ADDR low** for address 0x44 (what the firmware expects). Most breakouts have
+on-board pull-ups on SDA/SCL; if yours doesn't, add 4.7 kΩ pull-ups to 3V3.
 
 ### 120 VAC heater (SSR)
 
@@ -187,19 +188,25 @@ The fogger turns on if **either** demand is true, subject to a hard ceiling:
 > actuator can fix both — fogging would cool but over-humidify. In that case the
 > fogger stays off and the airflow fan takes over (below).
 
-### Airflow fan (variable speed)
+### Airflow fan (ON/OFF, temperature-driven)
 
-Baseline always-on, ramped up on demand (priority order):
+Not a baseline-on fan — it runs only when there's a reason to:
 
-| Trigger                                   | Speed                                  |
-|-------------------------------------------|----------------------------------------|
-| Default                                   | `FAN_MIN_DUTY` (50 %)                   |
-| RH above `RH_FOG_OFF` (65 %)              | Ramps **linearly** 50 % → 100 % as RH approaches the 78 % ceiling |
-| Too hot **and** RH at ceiling             | 100 % (only remaining cooling/venting tool) |
-| Canopy/trunk temp gap `> 4 °F`            | At least 70 % (destratify / mix air)   |
+| Condition          | Action          |
+|--------------------|-----------------|
+| Temp `≥ 77 °F` (`FAN_ON_F`) | Fan **ON** |
+| Temp `≤ 76 °F` (`FAN_OFF_F`) | Fan **OFF** |
+| In between         | Hold last state (hysteresis deadband) |
+| **Hourly minimum** | Forced **ON** for whatever it takes to reach **5 min** of run time in the rolling hour, even if temp never calls for it |
 
-The fan only ramps for venting when RH is *above* the fog-off point — below that
-it stays at baseline so it doesn't blow away humidity the fogger is building.
+The hourly minimum is tracked from the fan's *actual* run time (manual overrides
+count too). If temperature never triggers it, the make-up 5 minutes runs at the end
+of each hour. Runs even with no valid sensor — the temperature rule just switches
+off, leaving the hourly minimum in charge.
+
+> The fan no longer does humidity venting (that was tied to the old variable-speed
+> design). In practice the hot-and-humid case is still covered: if it's hot enough
+> to be a problem it's almost certainly above 77 °F, so the fan is already running.
 
 ---
 
@@ -208,11 +215,12 @@ it stays at baseline so it doesn't blow away humidity the fogger is building.
 The firmware is written to fail safe — losing a sensor or wedging the bus must
 never leave a 120 VAC heater running blind in a wet box.
 
-- **No blind heating.** If *both* sensors fail to return a valid reading (NaN or
+- **No blind heating.** If the sensor fails to return a valid reading (NaN or
   out-of-range), the heater and fogger are forced OFF and an `ALARM` status is
-  published. The fan stays at baseline.
-- **Hard thermal cutoff.** If *either* sensor reads `≥ 92 °F` (`TEMP_SAFETY_F`),
-  the heater is killed immediately, independent of the normal control band.
+  published. The fan still runs its hourly-minimum ventilation (temperature
+  control is simply disabled without a reading).
+- **Hard thermal cutoff.** If the sensor reads `≥ 92 °F` (`TEMP_SAFETY_F`), the
+  heater is killed immediately, independent of the normal control band.
 - **Application watchdog.** If `loop()` hangs for 60 s (e.g. a stuck I²C read),
   the board resets itself.
 - **Known-safe boot state.** All relays/MOSFETs are driven OFF before anything
@@ -239,14 +247,16 @@ Everything tunable is at the top of `everfresh.ino`:
 | `HEAT_OFF_F`        | `78.5`    | Heater off above this                                |
 | `COOL_ON_F`         | `84.0`    | Fog-for-cooling on above this                        |
 | `COOL_OFF_F`        | `82.0`    | Fog-for-cooling off below this                       |
-| `TEMP_SAFETY_F`     | `92.0`    | Either sensor above this → heater hard OFF           |
+| `TEMP_SAFETY_F`     | `92.0`    | Sensor above this → heater hard OFF                  |
 | `RH_FOG_ON`         | `55.0`    | Fog-for-humidity on below this                       |
 | `RH_FOG_OFF`        | `65.0`    | Fog-for-humidity off above this                      |
 | `RH_CEILING`        | `78.0`    | Never fog above this; fan venting target             |
-| `FAN_MIN_DUTY`      | `50`      | Always-on baseline fan speed (% of supply voltage)   |
-| `FAN_MAX_DUTY`      | `100`     | Max fan speed                                        |
-| `FAN_PWM_FREQ`      | `25000`   | PWM frequency (Hz) — above hearing range             |
-| `DESTRAT_GAP_F`     | `4.0`     | Canopy/trunk gap that triggers a mixing boost        |
+| `FAN_ON_F`          | `77.0`    | Fan turns ON above this canopy temp                  |
+| `FAN_OFF_F`         | `76.0`    | Fan turns OFF below this (hysteresis deadband)        |
+| `FAN_ON_DUTY`       | `100`     | "On" level. 100 % = steady 12 V (no PWM) for the 2-wire fan |
+| `FAN_MIN_MS_PER_HOUR` | `300000` | Guaranteed fan run time per hour (5 min) for air exchange |
+| `FAN_WINDOW_MS`     | `3600000` | Rolling window for the minimum (1 hour)              |
+| `FAN_PWM_FREQ`      | `18000`   | PWM frequency (Hz) — keep under your MOSFET board's max (this one: 20kHz) |
 | `HEAT_MIN_ON/OFF`   | `60000`   | Heater min on/off time (ms)                          |
 | `FOG_MIN_ON/OFF`    | `20000`   | Fogger min on/off time (ms)                          |
 | `CONTROL_INTERVAL`  | `3000`    | Control loop period (ms)                             |
@@ -279,33 +289,37 @@ infrastructure. Via the [Particle Console](https://console.particle.io), mobile
 app, or CLI:
 
 ```bash
-particle get <device-name> status      # e.g. "T=78.4F RH=61% | heat=off fog=off fan=50%"
+particle get <device-name> status      # e.g. "T=78.4F RH=61% | heat=off fog=off fan=100% [auto]"
 particle get <device-name> canopyTempF
 particle get <device-name> fanDuty
 ```
 
-**Cloud variables:** `canopyTempF`, `canopyRH`, `trunkTempF`, `trunkRH`,
-`fanDuty`, `heat` (0/1), `fog` (0/1), `mode` (`auto`/`manual`), `status`. A sensor
-reading of `-1` means that sensor is currently invalid.
+**Cloud variables:** `canopyTempF`, `canopyRH`, `fanDuty`, `heat` (0/1),
+`fog` (0/1), `mode` (`auto`/`manual`), `status`. A reading of `-1` means the sensor
+is currently invalid.
 
 **Published events:**
 
 | Event                   | When                              | Payload                          |
 |-------------------------|-----------------------------------|----------------------------------|
 | `everfresh/telemetry`   | every 60 s                        | JSON snapshot (see below)        |
+| `everfresh/event`       | an actuator toggles (heat/fog/vent) | `{"ev":"fog","state":"on","ct":78.2,"crh":54}` |
 | `everfresh/alert`       | only when alert state *changes*   | `no-sensor` / `overheat` / `cleared` |
 | `everfresh/cmd`         | when a manual override is invoked | what was commanded               |
+
+> **Daily history & charts:** forward these events to a Google Sheet (or any store)
+> — see [LOGGING.md](LOGGING.md) for the webhook + Apps Script setup.
 
 Telemetry JSON (compact, under the 255-byte event limit):
 
 ```json
-{"ct":78.4,"crh":61,"tt":77.9,"trh":63,"heat":0,"fog":0,"fan":50,"mode":"auto"}
+{"ct":78.4,"crh":61,"heat":0,"fog":0,"fan":50,"mode":"auto"}
 ```
 
-Keys: `ct`/`crh` = canopy temp/RH, `tt`/`trh` = trunk temp/RH, `heat`/`fog` =
-actuator state (0/1), `fan` = duty %, `mode` = auto or manual. Hook
-`everfresh/alert` to a webhook / IFTTT / email so you're notified the moment a
-sensor drops out or it overheats — these fire on the *transition*, not on a timer.
+Keys: `ct`/`crh` = canopy temp/RH, `heat`/`fog` = actuator state (0/1), `fan` =
+duty %, `mode` = auto or manual. Hook `everfresh/alert` to a webhook / IFTTT /
+email so you're notified the moment the sensor drops out or it overheats — these
+fire on the *transition*, not on a timer.
 
 ### Manual override functions (testing & maintenance)
 
@@ -331,9 +345,11 @@ it if a sensor *is* reading hot).
 
 Start here after first power-on:
 
-1. **Fan baseline.** Watch the fan at `FAN_MIN_DUTY = 50`. If it stalls or won't
-   start, raise it (e.g. 60–70). If it's louder/faster than you want at idle,
-   lower it. Remember duty ≈ fraction of supply voltage (50 % of 12 V ≈ 6 V).
+1. **Fan trigger.** The fan kicks on above `FAN_ON_F` (77 °F) and is guaranteed
+   ≥ 5 min/hour. To test it now, warm the sensor past 77 °F (or use
+   `setFan "100"`), and confirm the fan runs at full 12 V. *Note:* this 2-wire fan
+   is run ON/OFF only — smooth speed control returns with the 4-wire fan, at which
+   point you'd re-introduce PWM duty in `autoVentDuty()` / `writeFan()`.
 2. **Relay polarity.** If the heater/fogger turn on when they should be off, flip
    `RELAY_ACTIVE_LOW`.
 3. **Verify the safety cutoff** by temporarily lowering `TEMP_SAFETY_F` below
@@ -341,8 +357,8 @@ Start here after first power-on:
 4. **Watch a full cycle** in the console for a day. If the heater cycles too
    often, widen its deadband (lower `HEAT_ON_F` or raise `HEAT_OFF_F`). Same idea
    for the fogger via `RH_FOG_ON/OFF`.
-5. **Control point.** Currently canopy-primary. To average both sensors or
-   control off the trunk instead, change `readSensors()`.
+5. **Control point.** A single canopy SHT31 drives everything. If you later add a
+   second sensor, extend `readSensors()` to combine them.
 
 ---
 
