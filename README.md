@@ -138,9 +138,16 @@ All thresholds are in the `CONFIG` block of `everfresh.ino`.
 - ~30 s bursts. Min on/off timers prevent chatter.
 
 ### Circulation fan (internal mixing — no fresh air)
+Three speed regimes:
 - **100 % during any active cooling** — fogging (disperse mist) *or* venting (push hot
   air at the vent so heat doesn't stratify).
-- Otherwise **continuous gentle mixing** (`CIRC_MIX_DUTY`).
+- **RH-assist ramp** — when idle but RH is sagging toward the fog-on point, circ speed
+  ramps proportionally from `CIRC_MIX_DUTY` up to `CIRC_RH_ASSIST_MAX` (35 %) across the
+  band `[RH_FOG_ON, RH_FOG_ON + RH_ASSIST_BAND]` (65→75 %). More airflow over the damp
+  floor = more evaporation = RH propped up *before* the fogger has to fire. Goal: flatten
+  the RH decay and stretch the inter-fog interval (fewer, shallower sawteeth). Capped at
+  35 % so sustained airflow doesn't desiccate the foliage.
+- **Idle: continuous gentle mixing** (`CIRC_MIX_DUTY`) when RH is comfortable.
 - Recirculating over the damp floor homogenizes the air *and* evaporates standing
   water back into the chamber — sustains RH between fog cycles while drying the floor.
   (Proven 6/20: continuous mixing slowed RH decay dramatically and stopped the fogger
@@ -199,6 +206,8 @@ On-demand only, since the leaky chamber already exchanges air passively:
 | `RH_CEILING` | 90 | Never fog above |
 | `CIRC_FOG_DUTY` | 100 | Circ % during any active cooling (fog or vent) |
 | `CIRC_MIX_DUTY` | (your fan's min) | Circ % for continuous between-cycle mixing; **0 disables mixing** |
+| `CIRC_RH_ASSIST_MAX` | 35 | Circ % ceiling for the RH-assist ramp (gentle, foliage-safe) |
+| `RH_ASSIST_BAND` | 10 | RH span above `RH_FOG_ON` over which circ ramps idle→assist |
 | `VENT_SCHEDULE_ENABLED` | `false` | Periodic exchange on/off — off while chamber is leaky |
 | `VENT_DUTY` | 100 | Vent on/off (on=full) |
 | `VENT_INTERVAL_MS` / `_DURATION_MS` | 120 / 2 min | Periodic exchange (when enabled) |
@@ -314,6 +323,6 @@ Forward these to Google Sheets per [LOGGING.md](LOGGING.md).
 - [ ] **Alerting** — hook `everfresh/alert` to a phone/email notification.
 
 **Done:** dual SHT31 (canopy control + ambient), fogger, decoupled circ (PWM + true-off
-power MOSFET) and vent fans, **continuous circ mixing**, **temperature-reactive cooling
+power MOSFET) and vent fans, **continuous circ mixing + RH-assist speed ramp**, **temperature-reactive cooling
 ladder** (fog → ambient-gated vent + full circ → overheat panic), manual-override cloud
 functions (0/1), on-device VPD, Google Sheets logging with local time + VPD.

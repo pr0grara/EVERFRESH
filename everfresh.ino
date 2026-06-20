@@ -63,6 +63,13 @@ const int CIRC_FOG_DUTY = 100;   // % while fogging (disperse mist)
 // Proven on 6/20: with mixing running, canopy RH decayed far slower and the fogger
 // stopped thrashing; with mixing off, RH crashed and refired every ~5 min.
 const int CIRC_MIX_DUTY = 1;    // % continuous mix speed (lower if floor over-dries / too much leaf airflow; 0 = mixing OFF)
+// RH-assist: as canopy RH sags from the top of the assist band down toward the fog-on
+// point, ramp circ speed from CIRC_MIX_DUTY up to CIRC_RH_ASSIST_MAX — driving more
+// floor-water evaporation to prop RH up *before* the fogger fires. Goal: flatten the
+// RH decay (straighter lines, fewer/shallower sawteeth) and stretch the inter-fog
+// interval. Kept gentle so sustained airflow doesn't desiccate the foliage.
+const int   CIRC_RH_ASSIST_MAX = 35;    // % ceiling for the humidity-assist ramp
+const float RH_ASSIST_BAND     = 10.0;  // RH span above RH_FOG_ON over which circ ramps up (e.g. 65→75)
 
 // --- Vent fan (fresh-air exchange with ambient) ---
 // Chamber is leaky, so leaks already supply fresh air — the timed exchange is off
@@ -247,11 +254,21 @@ bool applyHysteresis(bool current, bool wantOn, unsigned long &lastChange,
   return wantOn;
 }
 
-// Circulation fan: full whenever we're actively moving heat or mist — while fogging
-// (disperse mist) or venting (push hot air at the vent) — otherwise continuous gentle
-// mixing (homogenize the air + evaporate the damp floor back into the chamber).
+// Circulation fan speed, three regimes:
+//   1. Active cooling/mist (fog or vent) → full, to disperse mist / feed the vent.
+//   2. RH-assist — RH sagging toward the fog-on point → ramp from the idle mix speed
+//      up to CIRC_RH_ASSIST_MAX, evaporating more floor water to prop RH up before the
+//      fogger fires (flatten the decay; fewer, shallower sawteeth).
+//   3. Idle → continuous gentle mixing (homogenize + slowly dry the floor).
 int circAutoDuty(bool fogActive, bool ventActive) {
-  return (fogActive || ventActive) ? CIRC_FOG_DUTY : CIRC_MIX_DUTY;
+  if (fogActive || ventActive) return CIRC_FOG_DUTY;     // (1) cooling / mist dispersion
+  if (!sensorsValid)           return CIRC_MIX_DUTY;     // no RH reading → gentle idle
+  // (2) RH-assist ramp across [RH_FOG_ON, RH_FOG_ON + RH_ASSIST_BAND].
+  float top = RH_FOG_ON + RH_ASSIST_BAND;
+  if (ctrlRH >= top)       return CIRC_MIX_DUTY;          // (3) RH healthy → idle mix
+  if (ctrlRH <= RH_FOG_ON) return CIRC_RH_ASSIST_MAX;     // at fog-on → max assist
+  float frac = (top - ctrlRH) / RH_ASSIST_BAND;          // 0 at top → 1 at fog-on
+  return CIRC_MIX_DUTY + (int)((CIRC_RH_ASSIST_MAX - CIRC_MIX_DUTY) * frac);
 }
 
 // Does venting actually cool right now? Only if it pulls in cooler air. With a valid
