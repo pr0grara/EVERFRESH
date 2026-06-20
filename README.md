@@ -294,9 +294,9 @@ particle get <device-name> canopyTempF
 particle get <device-name> fanDuty
 ```
 
-**Cloud variables:** `canopyTempF`, `canopyRH`, `fanDuty`, `heat` (0/1),
-`fog` (0/1), `mode` (`auto`/`manual`), `status`. A reading of `-1` means the sensor
-is currently invalid.
+**Cloud variables:** `canopyTempF`, `canopyRH`, `vpd` (kPa), `fanDuty`,
+`heat` (0/1), `fog` (0/1), `mode` (`auto`/`manual`), `status`. A reading of `-1`
+means the sensor is currently invalid.
 
 **Published events:**
 
@@ -313,11 +313,12 @@ is currently invalid.
 Telemetry JSON (compact, under the 255-byte event limit):
 
 ```json
-{"ct":78.4,"crh":61,"heat":0,"fog":0,"fan":50,"mode":"auto"}
+{"ct":78.4,"crh":61,"vpd":0.95,"heat":0,"fog":0,"fan":0,"mode":"auto"}
 ```
 
-Keys: `ct`/`crh` = canopy temp/RH, `heat`/`fog` = actuator state (0/1), `fan` =
-duty %, `mode` = auto or manual. Hook `everfresh/alert` to a webhook / IFTTT /
+Keys: `ct`/`crh` = canopy temp/RH, `vpd` = vapor pressure deficit (kPa), `heat`/`fog`
+= actuator state (0/1), `fan` = duty %, `mode` = auto or manual. Hook
+`everfresh/alert` to a webhook / IFTTT /
 email so you're notified the moment the sensor drops out or it overheats — these
 fire on the *transition*, not on a timer.
 
@@ -362,15 +363,69 @@ Start here after first power-on:
 
 ---
 
+## Field notes & observations (2026-06)
+
+Empirical findings from the first days of running, to design the future
+vent-fan controller against.
+
+**Fogger behavior**
+- A humidity fog cycle is a **~30 s ON dose** (timed) under the current
+  `RH_FOG_ON 55 / RH_FOG_OFF 75` band — short enough to add vapor, not flood.
+- **Long pulses saturate the chamber.** A bug once produced ~5-min continuous fog
+  cycles; the box saturated, deposited **liquid water on surfaces**, and RH then
+  took *far* longer to fall (wet surfaces re-evaporate). Lesson: keep doses short;
+  never run long continuous fog.
+- **Asymmetry:** humidity goes up fast (powerful fogger) but comes down slowly
+  (passive leak only — no active dehumidify). So overshoot is costly → bias the
+  control conservative (small doses, approach setpoint from below).
+
+**Ventilation / the "constant leak" effect** (A/B tested by unplugging the
+always-on hardwired 5 V fan, 2026-06-19):
+- **Fan ON (constant venting):** RH sawtooth period ≈ **4 min**, fogger cycling
+  frequently to fight the steady drying.
+- **Fan OFF (sealed):** sawtooth period stretched to ≈ **7 min** — about a
+  **40–45 % drop in fogger runtime** to hold the *same* RH band. The always-on fan
+  was the leak the fogger was chasing.
+- Sealed, RH still **falls back to the trigger on its own** (real passive leak) —
+  it did *not* pin at the ceiling, so a "hold" phase won't runaway-humidify at this
+  temp/leak rate.
+- Temp rose slightly (~74 → 76 °F) with no airflow → periodic mixing also helps
+  keep temperature even, not just air freshness.
+- VPD sits in a healthy ~**0.7–1.3 kPa** band at current settings.
+
+**Hardware caveat (current wiring)**
+- The vent-fan logic line (A5) is **cross-tied to the fogger line (D3)** — driving
+  the fan also fires the fogger. Mitigated in software (`VENT_FAN_ENABLED = false`,
+  A5 held Hi-Z); real ventilation is a 12 V fan hardwired to 5 V (constant).
+- To be fixed when **4-pin PWM fans arrive**: rewire so the vent fan has its own
+  pin + PWM control with no shared node, then re-enable in firmware.
+
+**Planned: vent-fan scheduler (post-rewire)** — "hold then mix":
+- Mostly **HOLD** (vent off) so the fogger/heater maintain conditions efficiently
+  against only the slow leak (captures the ~45 % efficiency win measured above).
+- Periodic **EXCHANGE** (vent on a short interval) for fresh air + mixing.
+- On-demand overrides independent of the cycle: **temp-too-high** (cool) and
+  **RH-too-high** (shed excess — the humidity-down lever currently missing).
+- Tuning tension to dial from logs: hold-duration vs exchange-duration.
+
+---
+
 ## Open items / TODO
 
-- [ ] **Fogger dry-run protection** — add a reservoir float switch on a GPIO and
-      block fogging when water is low (transducer burnout risk).
-- [ ] **Confirm A5 is PWM-capable** on the exact board being used.
-- [ ] **Finalize switch hardware** — SSR for heater, 2× logic-level MOSFETs for
-      the DC loads (2-wire fan confirmed).
-- [ ] **Alerting** — wire the `everfresh` publish to a notification on `ALARM` /
-      `OVERHEAT`.
-- [ ] Consider a min/max RH and temp **data log** (Particle integration → sheet)
-      to dial in setpoints over the plant's first season.
+- [ ] **4-pin PWM fans** (incoming) — rewire vent fan to its own pin with PWM
+      control, break the A5↔D3 cross-tie, then set `VENT_FAN_ENABLED = true`.
+- [ ] **Vent-fan "hold then mix" scheduler** — implement once rewired (see Field
+      notes). Mostly-off HOLD + periodic EXCHANGE + temp/RH overrides.
+- [ ] **Heater + SSR (Step 4)** — still unwired; the 120 VAC subsystem saved for last.
+- [ ] **Fogger dry-run protection** — reservoir float switch on a GPIO; block
+      fogging when water is low (transducer burnout risk).
+- [ ] **Flyback diode** on the fogger's 12 V mist fan before permanent install.
+- [ ] **Alerting** — hook `everfresh/alert` to a phone/email notification on
+      `no-sensor` / `overheat`.
+- [ ] **VPD-based control (future)** — once enough logs are digested, optionally
+      drive fogging off VPD instead of raw RH. Keep RH as the main loop until then.
+
+**Done:** single canopy SHT31 reading, fogger + mist fan (cross-tie mitigated),
+hardwired constant ventilation, manual-override cloud functions, Google Sheets data
+logging with local time + VPD, on-device VPD.
 ```

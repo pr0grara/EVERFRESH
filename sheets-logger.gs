@@ -16,6 +16,27 @@
 
 var SHEET_ID = '11bLXCx34tZWXnYe-mk9Jl52WSTpmxNaIX0cW2fmCqa8';
 
+// Your timezone — a named zone so daylight-saving is handled automatically.
+// (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
+var TZ = 'America/Los_Angeles';
+
+// VPD leaf-temperature offset (°C). 0 = "air VPD" (correct for a single air
+// sensor). Set to about -2 to estimate "leaf VPD" (leaves run a touch cooler than
+// air from transpiration), which is what many growers tune to.
+var LEAF_OFFSET_C = 0;
+
+// Vapor Pressure Deficit in kPa, from temp (°F) and RH (%). Returns '' if either
+// is missing (e.g. alert/cmd rows). Uses the Tetens saturation-pressure equation.
+function computeVPD(tempF, rh) {
+  var t = Number(tempF), r = Number(rh);
+  if (tempF === '' || rh === '' || isNaN(t) || isNaN(r)) return '';
+  var sat = function (tc) { return 0.61078 * Math.exp((17.27 * tc) / (tc + 237.3)); }; // kPa
+  var tAirC   = (t - 32) * 5 / 9;
+  var avp     = sat(tAirC) * (r / 100);        // actual vapor pressure (from air RH)
+  var svpLeaf = sat(tAirC + LEAF_OFFSET_C);    // saturation at leaf temp (offset 0 = air)
+  return Math.round((svpLeaf - avp) * 100) / 100;   // kPa, 2 decimals
+}
+
 function doPost(e) {
   try {
     // Particle's default webhook body: { event|name, data, published_at, coreid }.
@@ -32,16 +53,24 @@ function doPost(e) {
     var sheet = ss.getSheetByName('log') || ss.insertSheet('log');
 
     if (sheet.getLastRow() === 0) {
-      sheet.appendRow(['published_at', 'event', 'tempF', 'rh',
-                       'heat', 'fog', 'fan', 'mode', 'change', 'state', 'raw']);
+      sheet.appendRow(['published_at', 'local', 'event',
+                       'tempF', 'rh', 'vpd_kpa',
+                       'atempF', 'arh', 'avpd_kpa',
+                       'heat', 'fog', 'circ', 'vent', 'mode',
+                       'change', 'state', 'raw']);
     }
+
+    // Readable local time, DST-correct via the named zone. -> "6/18 2:58PM"
+    var local = '';
+    try { local = Utilities.formatDate(new Date(at), TZ, 'M/d h:mma'); } catch (err) {}
 
     var pick = function (k) { return d[k] !== undefined ? d[k] : ''; };
 
     sheet.appendRow([
-      at, name,
-      pick('ct'), pick('crh'),
-      pick('heat'), pick('fog'), pick('fan'), pick('mode'),
+      at, local, name,
+      pick('ct'),  pick('crh'),  computeVPD(pick('ct'),  pick('crh')),   // canopy
+      pick('at'),  pick('arh'),  computeVPD(pick('at'),  pick('arh')),   // ambient
+      pick('heat'), pick('fog'), pick('circ'), pick('vent'), pick('mode'),
       pick('ev'), pick('state'),
       raw
     ]);
@@ -78,8 +107,10 @@ function doGet(e) {
 function testWrite() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName('log') || ss.insertSheet('log');
-  sheet.appendRow([new Date().toISOString(), 'TEST', 99.9, 42,
-                   1, 0, 100, 'test', 'manual', 'on',
+  sheet.appendRow([new Date().toISOString(), 'now', 'TEST',
+                   99.9, 42, computeVPD(99.9, 42),
+                   72.0, 50, computeVPD(72.0, 50),
+                   1, 0, 60, 100, 'test', 'manual', 'on',
                    '{"note":"manual testWrite ok"}']);
   Logger.log('testWrite appended a row to sheet ' + SHEET_ID);
 }

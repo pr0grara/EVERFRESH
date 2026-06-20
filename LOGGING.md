@@ -73,8 +73,12 @@ particle call <device-name> runFogger "10"     # fires everfresh/cmd + everfresh
 Within a few seconds you should see rows appear. The 60 s telemetry will steadily
 add rows on its own. Columns:
 
-| published_at | event | tempF | rh | heat | fog | fan | mode | change | state | raw |
-|---|---|---|---|---|---|---|---|---|---|---|
+| published_at | local | event | tempF | rh | vpd_kpa | heat | fog | fan | mode | change | state | raw |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+
+`vpd_kpa` is Vapor Pressure Deficit (kPa), computed from `tempF`/`rh` — a better
+humidity-stress metric than raw RH because it factors in temperature. Set
+`LEAF_OFFSET_C` in the script to ~`-2` if you'd rather log *leaf* VPD than air VPD.
 
 - **Telemetry rows** fill `tempF…mode`.
 - **Event rows** fill `change` (heat/fog/vent) + `state` (on/off), plus `tempF/rh`
@@ -106,5 +110,7 @@ view, base the chart on the whole column so it grows as rows append.
   archive or roll to a new tab occasionally if you want to keep it snappy.
 - **Particle rate limit:** ~1 published event/sec average (burst 4). The firmware
   is well under this — telemetry is once a minute and actuator toggles are rare.
-- **Time zone:** `published_at` is UTC (ISO 8601). Convert in the Sheet with a
-  formula if you want local time.
+- **Time zone:** `published_at` is UTC (ISO 8601). The script also writes a
+  readable **`local`** column (e.g. `6/18 2:58PM`) using `Utilities.formatDate`
+  with the `TZ` constant — set `TZ` to your zone (e.g. `America/Los_Angeles`);
+  named zones apply daylight-saving automatically.
