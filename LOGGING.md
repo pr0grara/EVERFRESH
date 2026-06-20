@@ -11,7 +11,7 @@ The firmware already publishes everything needed (no code changes):
 
 | Event | When | Example payload |
 |-------|------|-----------------|
-| `everfresh/telemetry` | every 60 s | `{"ct":78.4,"crh":61,"heat":0,"fog":0,"fan":0,"mode":"auto"}` |
+| `everfresh/telemetry` | every 60 s | `{"ct":78.4,"crh":61,"vpd":0.95,"at":74.0,"arh":55,"avpd":1.20,"heat":0,"fog":0,"circ":0,"vent":0,"mode":"auto"}` |
 | `everfresh/event`     | actuator toggles | `{"ev":"fog","state":"on","ct":78.2,"crh":54}` |
 | `everfresh/alert`     | alarm change | `overheat` |
 | `everfresh/cmd`       | manual override | `fogger 10s` |
@@ -67,21 +67,21 @@ Save (and **Enable** it).
 Trigger something and watch a row land in the Sheet:
 
 ```bash
-particle call <device-name> runFogger "10"     # fires everfresh/cmd + everfresh/event
+particle call <device-name> setFog "1"          # fires everfresh/cmd + everfresh/event
 ```
 
 Within a few seconds you should see rows appear. The 60 s telemetry will steadily
 add rows on its own. Columns:
 
-| published_at | local | event | tempF | rh | vpd_kpa | heat | fog | fan | mode | change | state | raw |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| published_at | local | event | tempF | rh | vpd_kpa | atempF | arh | avpd_kpa | heat | fog | circ | vent | mode | change | state | raw |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 
 `vpd_kpa` is Vapor Pressure Deficit (kPa), computed from `tempF`/`rh` — a better
 humidity-stress metric than raw RH because it factors in temperature. Set
 `LEAF_OFFSET_C` in the script to ~`-2` if you'd rather log *leaf* VPD than air VPD.
 
 - **Telemetry rows** fill `tempF…mode`.
-- **Event rows** fill `change` (heat/fog/vent) + `state` (on/off), plus `tempF/rh`
+- **Event rows** fill `change` (heat/fog/circ/vent) + `state` (on/off), plus `tempF/rh`
   at that instant.
 - **alert/cmd rows** land in `raw` (plus the `event` column tells you which).
 

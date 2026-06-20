@@ -10,8 +10,9 @@
  *   FOG   — 24VDC ultrasonic fogger transducer/MOSFET (on/off, D3)
  *   CIRC  — 4-pin PWM circulation fan (A5): INTERNAL mixing, no fresh air.
  *           Runs full during every fog cycle + gentler on a periodic mix schedule.
- *   VENT  — 4-pin PWM exchange fan (A4): fresh-air exchange with ambient.
- *           Periodic exchange + temp-high / RH-high overrides.
+ *   VENT  — 2-wire exchange fan (A4): fresh-air exchange with ambient. On-demand:
+ *           cooling + high-RH safety. Periodic exchange disabled (leaky chamber) —
+ *           re-enable VENT_SCHEDULE_ENABLED once the chamber is sealed.
  *
  * 4-pin fans: PWM wire driven directly from the Photon (no MOSFET); 12V + GND
  * constant; tach unused. The fogger transducer (24V) keeps its MOSFET; heater its SSR.
@@ -55,16 +56,25 @@ const float RH_FOG_OFF = 75.0;   // fog OFF above this
 const float RH_CEILING = 90.0;   // never fog above this
 
 // --- Circulation fan (internal mixing; no fresh air) ---
-// Simple mode: runs ONLY during fog cycles (disperse mist). No standalone schedule.
-const int CIRC_FOG_DUTY = 100;   // % while fogging
+const int CIRC_FOG_DUTY = 100;   // % while fogging (disperse mist)
+// Between fog cycles: gentle low-speed mixing on a ~50% duty cycle. Recirculating
+// over the damp floor homogenizes the air AND evaporates standing water back into
+// the chamber — dries the floor and nudges humidity up (no fresh air pulled in).
+const int CIRC_MIX_DUTY = 1;    // nonzero = powered at min RPM (fan floors low PWM); 0 = mixing OFF
+const unsigned long CIRC_MIX_ON_MS  = 15UL * 60 * 1000;  // mixing ON 15 min
+const unsigned long CIRC_MIX_OFF_MS = 15UL * 60 * 1000;  // OFF 15 min (≈ 50% duty)
 
 // --- Vent fan (fresh-air exchange with ambient) ---
+// Chamber is leaky, so leaks already supply fresh air — the timed exchange is off
+// for now and the vent is purely on-demand (cooling + high-RH safety, below).
+// Re-enable the schedule once the chamber is sealed.
+const bool VENT_SCHEDULE_ENABLED = false;
 const int VENT_DUTY = 100;       // % when exchanging
-const unsigned long VENT_INTERVAL_MS = 120UL * 60 * 1000;  // exchange every 120 min
+const unsigned long VENT_INTERVAL_MS = 120UL * 60 * 1000;  // exchange every 120 min (when enabled)
 const unsigned long VENT_DURATION_MS =  2UL * 60 * 1000;  // for 2 min
 // On-demand vent overrides (independent of the schedule), with hysteresis:
-const float VENT_TEMP_ON_F  = 83.0;  // vent to cool above this
-const float VENT_TEMP_OFF_F = 81.0;
+const float VENT_TEMP_ON_F  = 86.0;  // vent to cool above this
+const float VENT_TEMP_OFF_F = 82.0;
 const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this
 const float VENT_RH_OFF     = 80.0;
 
@@ -232,16 +242,22 @@ bool applyHysteresis(bool current, bool wantOn, unsigned long &lastChange,
   return wantOn;
 }
 
-// Circulation fan: ON (full) only while fogging, to disperse mist. Off otherwise.
-int circAutoDuty(bool fogActive) {
-  return fogActive ? CIRC_FOG_DUTY : 0;
+// Circulation fan: full while fogging (disperse mist); otherwise gentle low-speed
+// mixing on a free-running ~50% duty cycle (homogenize + dry the floor).
+int circAutoDuty(unsigned long now, bool fogActive) {
+  if (fogActive) return CIRC_FOG_DUTY;
+  unsigned long period = CIRC_MIX_ON_MS + CIRC_MIX_OFF_MS;
+  return ((now % period) < CIRC_MIX_ON_MS) ? CIRC_MIX_DUTY : 0;
 }
 
 // Vent fan: periodic fresh-air exchange, plus temp-high / RH-high overrides.
 // (Ambient-aware decisions come later; for now it's schedule + thresholds.)
 int ventAutoDuty(unsigned long now) {
-  if (now - ventCycleStart >= VENT_INTERVAL_MS) ventCycleStart = now;
-  bool exchangeWindow = (now - ventCycleStart) < VENT_DURATION_MS;
+  bool exchangeWindow = false;
+  if (VENT_SCHEDULE_ENABLED) {
+    if (now - ventCycleStart >= VENT_INTERVAL_MS) ventCycleStart = now;
+    exchangeWindow = (now - ventCycleStart) < VENT_DURATION_MS;
+  }
 
   if (sensorsValid) {
     if (!tempVentOn && ctrlTempF >= VENT_TEMP_ON_F)  tempVentOn = true;
@@ -304,7 +320,7 @@ void control() {
   writeRelay(PIN_FOG,  fogOn);
 
   // ===== 5) fans (PWM) =====
-  int circReq = circManual ? circOverrideDuty : circAutoDuty(fogOn);
+  int circReq = circManual ? circOverrideDuty : circAutoDuty(now, fogOn);
   int ventReq = ventManual ? ventOverrideDuty : ventAutoDuty(now);
   writeCirc(circReq);
   writeVent(ventReq);
