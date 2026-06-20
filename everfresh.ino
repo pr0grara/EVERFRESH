@@ -4,12 +4,12 @@
  *
  * Sensors : 2x SHT31 over I2C
  *   canopy  @ 0x44  — the CONTROL POINT (all decisions use this)
- *   ambient @ 0x45  — reference / logging only (room air the vent pulls in)
+ *   ambient @ 0x45  — reference + gates vent cooling (room air the vent pulls in)
  * Actuators:
  *   HEAT  — 120VAC heater via SSR                    (on/off, D2)
  *   FOG   — 24VDC ultrasonic fogger transducer/MOSFET (on/off, D3)
  *   CIRC  — 4-pin PWM circulation fan (A5): INTERNAL mixing, no fresh air.
- *           Runs full during every fog cycle + gentler on a periodic mix schedule.
+ *           Runs full during every fog cycle + continuous gentle mixing between cycles.
  *   VENT  — 2-wire exchange fan (A4): fresh-air exchange with ambient. On-demand:
  *           cooling + high-RH safety. Periodic exchange disabled (leaky chamber) —
  *           re-enable VENT_SCHEDULE_ENABLED once the chamber is sealed.
@@ -51,18 +51,18 @@ const float COOL_ON_F     = 84.0;   // fog-for-cooling ON above this
 const float COOL_OFF_F    = 82.0;   // fog-for-cooling OFF below this
 
 // --- Humidity setpoints (%RH) ---  target band 50–80
-const float RH_FOG_ON  = 55.0;   // fog (humidity) ON below this
-const float RH_FOG_OFF = 75.0;   // fog OFF above this
+const float RH_FOG_ON  = 65.0;   // fog (humidity) ON below this
+const float RH_FOG_OFF = 80.0;   // fog OFF above this
 const float RH_CEILING = 90.0;   // never fog above this
 
 // --- Circulation fan (internal mixing; no fresh air) ---
 const int CIRC_FOG_DUTY = 100;   // % while fogging (disperse mist)
-// Between fog cycles: gentle low-speed mixing on a ~50% duty cycle. Recirculating
-// over the damp floor homogenizes the air AND evaporates standing water back into
-// the chamber — dries the floor and nudges humidity up (no fresh air pulled in).
-const int CIRC_MIX_DUTY = 1;    // nonzero = powered at min RPM (fan floors low PWM); 0 = mixing OFF
-const unsigned long CIRC_MIX_ON_MS  = 15UL * 60 * 1000;  // mixing ON 15 min
-const unsigned long CIRC_MIX_OFF_MS = 15UL * 60 * 1000;  // OFF 15 min (≈ 50% duty)
+// Between fog cycles: CONTINUOUS gentle mixing. Recirculating over the damp floor
+// homogenizes the air AND evaporates standing water back into the chamber — this
+// sustains RH between fog cycles and dries the floor (no fresh air pulled in).
+// Proven on 6/20: with mixing running, canopy RH decayed far slower and the fogger
+// stopped thrashing; with mixing off, RH crashed and refired every ~5 min.
+const int CIRC_MIX_DUTY = 1;    // % continuous mix speed (lower if floor over-dries / too much leaf airflow; 0 = mixing OFF)
 
 // --- Vent fan (fresh-air exchange with ambient) ---
 // Chamber is leaky, so leaks already supply fresh air — the timed exchange is off
@@ -77,6 +77,11 @@ const float VENT_TEMP_ON_F  = 86.0;  // vent to cool above this
 const float VENT_TEMP_OFF_F = 82.0;
 const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this
 const float VENT_RH_OFF     = 80.0;
+// Vent only cools if it pulls in cooler air. With a valid ambient reading, require the
+// canopy to be at least this much hotter than the room before venting to cool. Until
+// the ambient sensor is installed this guard is skipped (the room is known to be
+// cooler than the sunlit tent during the solar spike, so venting always helps then).
+const float VENT_AMBIENT_DELTA_F = 3.0;
 
 // --- Min on/off times for on/off loads (anti-chatter, ms) ---
 const unsigned long HEAT_MIN_ON = 60000, HEAT_MIN_OFF = 60000;
@@ -242,16 +247,23 @@ bool applyHysteresis(bool current, bool wantOn, unsigned long &lastChange,
   return wantOn;
 }
 
-// Circulation fan: full while fogging (disperse mist); otherwise gentle low-speed
-// mixing on a free-running ~50% duty cycle (homogenize + dry the floor).
-int circAutoDuty(unsigned long now, bool fogActive) {
-  if (fogActive) return CIRC_FOG_DUTY;
-  unsigned long period = CIRC_MIX_ON_MS + CIRC_MIX_OFF_MS;
-  return ((now % period) < CIRC_MIX_ON_MS) ? CIRC_MIX_DUTY : 0;
+// Circulation fan: full whenever we're actively moving heat or mist — while fogging
+// (disperse mist) or venting (push hot air at the vent) — otherwise continuous gentle
+// mixing (homogenize the air + evaporate the damp floor back into the chamber).
+int circAutoDuty(bool fogActive, bool ventActive) {
+  return (fogActive || ventActive) ? CIRC_FOG_DUTY : CIRC_MIX_DUTY;
 }
 
-// Vent fan: periodic fresh-air exchange, plus temp-high / RH-high overrides.
-// (Ambient-aware decisions come later; for now it's schedule + thresholds.)
+// Does venting actually cool right now? Only if it pulls in cooler air. With a valid
+// ambient reading, require a real canopy-minus-ambient gap; without the sensor, trust
+// that the room is cooler than the sunlit tent during a spike.
+bool ventCools() {
+  if (ambient.ok) return (ctrlTempF - ambient.tempF) >= VENT_AMBIENT_DELTA_F;
+  return true;
+}
+
+// Vent fan (reactive): cool when the canopy runs hot AND venting can actually help,
+// plus an always-allowed high-RH relief valve. (Periodic exchange schedule optional.)
 int ventAutoDuty(unsigned long now) {
   bool exchangeWindow = false;
   if (VENT_SCHEDULE_ENABLED) {
@@ -260,8 +272,11 @@ int ventAutoDuty(unsigned long now) {
   }
 
   if (sensorsValid) {
-    if (!tempVentOn && ctrlTempF >= VENT_TEMP_ON_F)  tempVentOn = true;
-    else if (tempVentOn && ctrlTempF <= VENT_TEMP_OFF_F) tempVentOn = false;
+    // Cool-vent: hysteresis on temp, gated by whether venting can actually cool.
+    bool canCool = ventCools();
+    if (!tempVentOn && canCool && ctrlTempF >= VENT_TEMP_ON_F)         tempVentOn = true;
+    else if (tempVentOn && (!canCool || ctrlTempF <= VENT_TEMP_OFF_F)) tempVentOn = false;
+    // RH-relief: independent humidity safety valve (last resort — open the box).
     if (!rhVentOn && ctrlRH >= VENT_RH_ON)   rhVentOn = true;
     else if (rhVentOn && ctrlRH <= VENT_RH_OFF) rhVentOn = false;
   } else {
@@ -319,9 +334,15 @@ void control() {
   writeRelay(PIN_HEAT, heatOn);
   writeRelay(PIN_FOG,  fogOn);
 
-  // ===== 5) fans (PWM) =====
-  int circReq = circManual ? circOverrideDuty : circAutoDuty(now, fogOn);
+  // ===== 5) fans — vent first (primary heat removal), then circ moves air to it =====
   int ventReq = ventManual ? ventOverrideDuty : ventAutoDuty(now);
+  int circReq = circManual ? circOverrideDuty : circAutoDuty(fogOn, ventReq > 0);
+
+  // ===== 5b) OVERHEAT PANIC — dump heat: vent full + max air movement =====
+  // Beats manual and the ambient guard; heat removal is the only priority up here.
+  // (Heater is already locked off above; fog keeps cooling unless it hit RH_CEILING.)
+  if (overheat) { ventReq = VENT_DUTY; circReq = CIRC_FOG_DUTY; }
+
   writeCirc(circReq);
   writeVent(ventReq);
 

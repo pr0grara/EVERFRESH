@@ -18,20 +18,22 @@ Earring Tree), a tropical legume, on a **Particle Photon**.
 
 **Two SHT31 sensors** over one I²C bus:
 - **canopy** (`0x44`) — the **control point**; every decision uses this.
-- **ambient** (`0x45`) — room air, reference/logging only (what the vent pulls in).
+- **ambient** (`0x45`) — room air (what the vent pulls in); logged, **and gates vent
+  cooling** — the vent only cools when the room is meaningfully cooler than the canopy.
 
 **Four actuators:**
 - **HEAT** — 120 VAC heater via SSR (on/off).
 - **FOG** — 24 VDC ultrasonic fogger transducer via MOSFET (on/off). Raises humidity;
   also provides evaporative cooling when hot.
 - **CIRC** — 4-wire PWM circulation fan: **internal mixing, no fresh air**. Full speed
-  during fog (mist dispersion) + gentle low-speed mixing between cycles.
+  during any active cooling (fog mist-dispersion or venting) + **continuous gentle
+  mixing** between cycles.
 - **VENT** — 2-wire exchange fan via MOSFET: **fresh-air exchange** with ambient.
-  On-demand — cooling + high-RH safety. (Scheduled exchange is off while the chamber
-  is leaky; re-enable once it's sealed.)
+  On-demand — cooling (when the room can actually help) + high-RH safety. (Scheduled
+  exchange is off while the chamber is leaky; re-enable once it's sealed.)
 
 Control is **hysteresis bang-bang** for heat and fog (RH is the humidity loop), and
-schedule + threshold logic for the fans. VPD is computed on-device and logged.
+temperature-reactive threshold logic for the fans. VPD is computed on-device and logged.
 
 ---
 
@@ -130,23 +132,39 @@ All thresholds are in the `CONFIG` block of `everfresh.ino`.
 | Temp ≥ 92 °F (`TEMP_SAFETY_F`), any cause | hard OFF |
 
 ### Fogger (humidity + evaporative cooling)
-- **Humidity:** ON below `RH_FOG_ON` (55 %), OFF above `RH_FOG_OFF` (75 %).
+- **Humidity:** ON below `RH_FOG_ON` (65 %), OFF above `RH_FOG_OFF` (80 %).
 - **Cooling:** ON above `COOL_ON_F` (84 °F), OFF below `COOL_OFF_F` (82 °F).
 - **Hard ceiling:** never fog above `RH_CEILING` (90 %).
 - ~30 s bursts. Min on/off timers prevent chatter.
 
 ### Circulation fan (internal mixing — no fresh air)
-- **100 % during any fog cycle** (disperse mist).
-- Otherwise **gentle low-speed mixing** (`CIRC_MIX_DUTY`) on a free-running ~50 %
-  duty cycle (`CIRC_MIX_ON_MS` / `CIRC_MIX_OFF_MS`, default 15/15 min).
+- **100 % during any active cooling** — fogging (disperse mist) *or* venting (push hot
+  air at the vent so heat doesn't stratify).
+- Otherwise **continuous gentle mixing** (`CIRC_MIX_DUTY`).
 - Recirculating over the damp floor homogenizes the air *and* evaporates standing
-  water back into the chamber — dries the floor while nudging humidity up.
+  water back into the chamber — sustains RH between fog cycles while drying the floor.
+  (Proven 6/20: continuous mixing slowed RH decay dramatically and stopped the fogger
+  thrashing vs. the old on/off mixing schedule.)
+
+### Cooling ladder (temperature-reactive)
+Cooling escalates with canopy temperature; everything is hysteretic (no chatter). The
+chamber runs *cold* most of the day, so these only fire during the afternoon solar
+spike — temperature is effectively the schedule.
+
+| Canopy temp | Response |
+|-------------|----------|
+| ≥ `COOL_ON_F` (84 °F) | **Fog** — evaporative cooling + restores the RH the heat spike steals (cut at `RH_CEILING`) |
+| ≥ `VENT_TEMP_ON_F` (86 °F) | **Vent** adds (primary heat-*energy* removal) **+ circ to full** |
+| ≥ `TEMP_SAFETY_F` (92 °F) | **Panic**: vent + circ forced full (beats manual), heater hard-off |
 
 ### Vent fan (fresh-air exchange — on/off)
-On-demand only (hysteresis), since the leaky chamber already exchanges air passively:
-- **Cooling** (primary): vent if temp ≥ `VENT_TEMP_ON_F` (off below `VENT_TEMP_OFF_F`).
-- **High-RH safety**: vent if RH ≥ `VENT_RH_ON` (off below `VENT_RH_OFF`) — the active
-  humidity-*down* lever near saturation.
+On-demand only, since the leaky chamber already exchanges air passively:
+- **Cooling** (primary): vent if temp ≥ `VENT_TEMP_ON_F` (off below `VENT_TEMP_OFF_F`),
+  **but only when venting actually cools** — with a valid ambient reading it requires
+  `canopy − ambient ≥ VENT_AMBIENT_DELTA_F` (3 °F). Until the ambient sensor is
+  installed the guard is skipped (the room is known cooler than the sunlit tent).
+- **High-RH safety**: vent if RH ≥ `VENT_RH_ON` (off below `VENT_RH_OFF`) — an
+  independent humidity-*down* relief valve near saturation, *not* ambient-gated.
 - **Scheduled exchange** (`VENT_DURATION_MS` every `VENT_INTERVAL_MS`) is gated by
   `VENT_SCHEDULE_ENABLED` — **off** for now; re-enable once the chamber is sealed and
   leaks no longer supply fresh air.
@@ -157,7 +175,8 @@ On-demand only (hysteresis), since the leaky chamber already exchanges air passi
 
 - **No blind heating** — if the canopy sensor is invalid, heater + fogger forced OFF,
   `ALARM` published.
-- **Hard thermal cutoff** at `TEMP_SAFETY_F`.
+- **Hard thermal cutoff** at `TEMP_SAFETY_F` — heater off *and* vent + circ forced to
+  full to dump heat, overriding any manual hold.
 - **Watchdog** resets the board if `loop()` hangs > 60 s.
 - **Known-safe boot** — all loads off before anything else.
 - **Min on/off timers** on heater (60 s) and fogger (20 s).
@@ -176,16 +195,16 @@ On-demand only (hysteresis), since the leaky chamber already exchanges air passi
 | `HEAT_ON_F` / `HEAT_OFF_F` | 76 / 78.5 | Heater band |
 | `TEMP_SAFETY_F` | 92 | Heater hard-off |
 | `COOL_ON_F` / `COOL_OFF_F` | 84 / 82 | Fog-for-cooling band |
-| `RH_FOG_ON` / `RH_FOG_OFF` | 55 / 75 | Fog (humidity) band |
+| `RH_FOG_ON` / `RH_FOG_OFF` | 65 / 80 | Fog (humidity) band |
 | `RH_CEILING` | 90 | Never fog above |
-| `CIRC_FOG_DUTY` | 100 | Circ % during fog |
-| `CIRC_MIX_DUTY` | (your fan's min) | Circ % for between-fog mixing; **0 disables mixing** |
-| `CIRC_MIX_ON_MS` / `_OFF_MS` | 15 / 15 min | Mixing duty cycle |
+| `CIRC_FOG_DUTY` | 100 | Circ % during any active cooling (fog or vent) |
+| `CIRC_MIX_DUTY` | (your fan's min) | Circ % for continuous between-cycle mixing; **0 disables mixing** |
 | `VENT_SCHEDULE_ENABLED` | `false` | Periodic exchange on/off — off while chamber is leaky |
 | `VENT_DUTY` | 100 | Vent on/off (on=full) |
 | `VENT_INTERVAL_MS` / `_DURATION_MS` | 120 / 2 min | Periodic exchange (when enabled) |
-| `VENT_TEMP_ON_F` / `_OFF_F` | 83 / 81 | Vent-to-cool override |
-| `VENT_RH_ON` / `_OFF` | 88 / 80 | Vent-to-shed-humidity override |
+| `VENT_TEMP_ON_F` / `_OFF_F` | 86 / 82 | Vent-to-cool band |
+| `VENT_RH_ON` / `_OFF` | 88 / 80 | Vent-to-shed-humidity band |
+| `VENT_AMBIENT_DELTA_F` | 3 | Min canopy − ambient gap to vent-cool (skipped w/o ambient sensor) |
 | `HEAT_MIN_ON/OFF`, `FOG_MIN_ON/OFF` | 60s / 20s | Anti-chatter |
 
 ---
@@ -239,7 +258,7 @@ Forward these to Google Sheets per [LOGGING.md](LOGGING.md).
 
 1. **Circ min speed.** Find the lowest PWM your fan reliably *starts* at
    (`setCirc "20"`, lower until it won't spin, back off a notch) and set
-   `CIRC_MIX_DUTY` there. `0` keeps mixing off (circ only runs during fog).
+   `CIRC_MIX_DUTY` there. `0` keeps mixing off (circ then only runs during cooling).
 2. **Verify true-off** — `setCirc "0"` should dead-stop the circ fan (power MOSFET
    cuts it). If it idles, check the tach wire is cut/insulated.
 3. **Relay polarity** — flip `RELAY_ACTIVE_LOW` if loads invert.
@@ -269,6 +288,13 @@ Forward these to Google Sheets per [LOGGING.md](LOGGING.md).
 - **Recirculation ≠ ventilation:** the circ fan mixes internal air (and evaporates
   floor water back into the chamber); only the vent exchanges with ambient. Decoupling
   them was the key architecture split.
+- **Continuous mixing sustains RH (6/20):** under the old 15-on/15-off mixing schedule,
+  RH crashed and the fogger refired every ~5 min during the OFF halves; with mixing left
+  **on continuously**, RH decayed far more slowly and fog cycling nearly stopped. The
+  circ fan is effectively a slow humidifier (evaporates the damp floor back into the
+  air). **Open question:** with continuous mixing RH appears to settle in the **low 60s
+  %** — watch whether that floor is too dry for this tropical species; if so, raise
+  `RH_FOG_ON` to fog sooner, or accept the higher fog duty.
 
 ---
 
@@ -278,13 +304,16 @@ Forward these to Google Sheets per [LOGGING.md](LOGGING.md).
 - [ ] **Heater + SSR (Step 4)** — 120 VAC subsystem still to be wired.
 - [ ] **Fogger dry-run protection** — reservoir float switch on a GPIO.
 - [ ] **Flyback diodes** on the fan MOSFETs before permanent install.
-- [ ] **Post-fog circ boost** — extra low-speed mixing right after each fog (floor
-      is wettest then) on top of the baseline duty cycle.
-- [ ] **Ambient-aware venting** — use the ambient sensor to vent only when the room
-      air moves the chamber toward target.
+- [ ] **Install ambient SHT31 (0x45)** — arriving 6/21; activates the vent cooling
+      guard (`VENT_AMBIENT_DELTA_F`) automatically once it reads valid.
+- [ ] **RH floor check** — confirm the low-60s %RH settling point under continuous
+      mixing isn't too dry for the plant (raise `RH_FOG_ON` if so).
 - [ ] **VPD-based control + day/night zones** — once enough logs are digested.
+- [ ] **Optional solar-window awareness** — publish a "spike-season" flag / slightly
+      pre-emptive cooling during the afternoon window (needs cloud-time + DST).
 - [ ] **Alerting** — hook `everfresh/alert` to a phone/email notification.
 
 **Done:** dual SHT31 (canopy control + ambient), fogger, decoupled circ (PWM + true-off
-power MOSFET) and vent fans, manual-override cloud functions (0/1), on-device VPD,
-Google Sheets logging with local time + VPD.
+power MOSFET) and vent fans, **continuous circ mixing**, **temperature-reactive cooling
+ladder** (fog → ambient-gated vent + full circ → overheat panic), manual-override cloud
+functions (0/1), on-device VPD, Google Sheets logging with local time + VPD.
