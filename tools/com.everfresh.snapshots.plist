@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EVERFRESH daily chart snapshots.
+  Runs sheet_snapshots.py once a day at 21:00 (9 PM) local time.
+  The 3h window at 9 PM captures that day's solar spike + recovery;
+  24h captures the full day. Change Hour/Minute below to retime it.
+
+  Install:
+    cp tools/com.everfresh.snapshots.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.everfresh.snapshots.plist
+  Run once now to test:
+    launchctl start com.everfresh.snapshots
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.everfresh.snapshots</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/arabaghdassarian/Desktop/Work/EVRFRSH/tools/.venv/bin/python3</string>
+    <string>/Users/arabaghdassarian/Desktop/Work/EVRFRSH/tools/sheet_snapshots.py</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>21</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/arabaghdassarian/Desktop/Work/EVRFRSH/tools/snapshots.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/arabaghdassarian/Desktop/Work/EVRFRSH/tools/snapshots.err.log</string>
+</dict>
+</plist>

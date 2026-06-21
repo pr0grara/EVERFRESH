@@ -10,7 +10,9 @@ Earring Tree), a tropical legume, on a **Particle Photon**.
 | VPD         | logged       | Vapor Pressure Deficit, for future VPD-based control |
 
 > **Setting up?** Follow [WIRING_AND_SETUP.md](WIRING_AND_SETUP.md) (staged,
-> safest-first bring-up). For data logging, see [LOGGING.md](LOGGING.md).
+> safest-first bring-up). For data logging, see [LOGGING.md](LOGGING.md). For the *why*
+> behind the setpoints — the "grow hard" intent — see [GROW_PHILOSOPHY.md](GROW_PHILOSOPHY.md).
+> Running field journal of plant + chamber behavior: [OBSERVATIONS.md](OBSERVATIONS.md).
 
 ---
 

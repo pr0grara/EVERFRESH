@@ -1,0 +1,6 @@
+# EVERFRESH local artifacts (not source)
+snapshots/
+tools/.venv/
+tools/*.log
+__pycache__/
+*.pyc
