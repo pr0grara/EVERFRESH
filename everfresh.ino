@@ -46,7 +46,7 @@ const uint8_t ADDR_AMBIENT = 0x45;
 // --- Temperature setpoints (°F) ---  target band 75–85
 const float HEAT_ON_F     = 76.0;   // heater ON below this
 const float HEAT_OFF_F    = 78.5;   // heater OFF above this (hysteresis)
-const float TEMP_SAFETY_F = 92.0;   // canopy above this => heater hard OFF
+const float TEMP_SAFETY_F = 92.0;   // canopy above this => heater hard OFF + "hot" alarm (no longer force-vents)
 const float COOL_ON_F     = 84.0;   // fog-for-cooling ON above this
 const float COOL_OFF_F    = 82.0;   // fog-for-cooling OFF below this
 
@@ -79,9 +79,21 @@ const bool VENT_SCHEDULE_ENABLED = false;
 const int VENT_DUTY = 100;       // % when exchanging
 const unsigned long VENT_INTERVAL_MS = 120UL * 60 * 1000;  // exchange every 120 min (when enabled)
 const unsigned long VENT_DURATION_MS =  2UL * 60 * 1000;  // for 2 min
-// On-demand vent overrides (independent of the schedule), with hysteresis:
-const float VENT_TEMP_ON_F  = 86.0;  // vent to cool above this
-const float VENT_TEMP_OFF_F = 82.0;
+// On-demand cooling vent, WIDE hysteresis. 6/20 finding: continuous venting barely
+// cooled (temp held ~88-90°F on fog alone) but crashed RH/VPD (VPD ~2.5 vented vs ~1.25
+// fog-only). So the vent now sleeps through the range fog can hold and only wakes for a
+// genuine peak, then hands straight back to fog. Runs full when on.
+const float VENT_TEMP_ON_F  = 94.0;  // vent ONLY above this (fog is the cooler from 84-94)
+const float VENT_TEMP_OFF_F = 90.0;  // ...shut off once back down here (fog takes over again)
+const float VENT_EMERGENCY_F = 99.0; // hard backstop: force vent full OVER manual (runaway guard)
+// Above VENT_TEMP_ON_F the cooling vent PULSES instead of running continuously: short ON
+// bursts with long OFF gaps so RH/VPD recover between them (6/20: a 3-min vent-off
+// recovered humidity hugely with little temp cost). It keeps chipping at the peak at this
+// ~25% duty until temp falls back under VENT_TEMP_OFF_F — and if it never does, it caps
+// the humidity damage rather than crashing RH continuously. (VENT_EMERGENCY_F still wins.)
+// The vent is binary (no PWM), so time-pulsing is the only way to get a fractional duty.
+const unsigned long VENT_PULSE_ON_MS  =  60UL * 1000;  // vent 1 min...
+const unsigned long VENT_PULSE_OFF_MS = 180UL * 1000;  // ...then off 3 min, repeat
 const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this
 const float VENT_RH_OFF     = 80.0;
 // Vent only cools if it pulls in cooler air. With a valid ambient reading, require the
@@ -124,6 +136,7 @@ bool tempVentOn = false, rhVentOn = false;
 // Schedules
 unsigned long lastControl = 0, lastPublish = 0;
 unsigned long ventCycleStart = 0;
+unsigned long ventPulseStart = 0;   // anchors the cool-vent ON/OFF pulse to peak entry
 
 // Manual overrides — while *Until is in the future, that actuator is forced.
 unsigned long heatOverrideUntil = 0; bool heatOverrideOn  = false;
@@ -279,8 +292,9 @@ bool ventCools() {
   return true;
 }
 
-// Vent fan (reactive): cool when the canopy runs hot AND venting can actually help,
-// plus an always-allowed high-RH relief valve. (Periodic exchange schedule optional.)
+// Vent fan (reactive): above VENT_TEMP_ON_F, PULSE-cool (short bursts so RH recovers)
+// while venting can actually help; plus an always-allowed continuous high-RH relief
+// valve. (Periodic exchange schedule optional.)
 int ventAutoDuty(unsigned long now) {
   bool exchangeWindow = false;
   if (VENT_SCHEDULE_ENABLED) {
@@ -288,19 +302,26 @@ int ventAutoDuty(unsigned long now) {
     exchangeWindow = (now - ventCycleStart) < VENT_DURATION_MS;
   }
 
+  bool coolPulseOn = false;
   if (sensorsValid) {
-    // Cool-vent: hysteresis on temp, gated by whether venting can actually cool.
+    // Cool-vent: above VENT_TEMP_ON_F enter PULSE mode (tempVentOn); leave under
+    // VENT_TEMP_OFF_F or when venting can't cool. Anchor the pulse to entry so the first
+    // ON burst hits the peak immediately, then cycle ON_MS on / OFF_MS off while in mode.
     bool canCool = ventCools();
-    if (!tempVentOn && canCool && ctrlTempF >= VENT_TEMP_ON_F)         tempVentOn = true;
+    if (!tempVentOn && canCool && ctrlTempF >= VENT_TEMP_ON_F)         { tempVentOn = true; ventPulseStart = now; }
     else if (tempVentOn && (!canCool || ctrlTempF <= VENT_TEMP_OFF_F)) tempVentOn = false;
-    // RH-relief: independent humidity safety valve (last resort — open the box).
+    if (tempVentOn) {
+      unsigned long period = VENT_PULSE_ON_MS + VENT_PULSE_OFF_MS;
+      coolPulseOn = ((now - ventPulseStart) % period) < VENT_PULSE_ON_MS;
+    }
+    // RH-relief: independent humidity safety valve (last resort — open the box). Continuous.
     if (!rhVentOn && ctrlRH >= VENT_RH_ON)   rhVentOn = true;
     else if (rhVentOn && ctrlRH <= VENT_RH_OFF) rhVentOn = false;
   } else {
     tempVentOn = false; rhVentOn = false;
   }
 
-  return (exchangeWindow || tempVentOn || rhVentOn) ? VENT_DUTY : 0;
+  return (exchangeWindow || coolPulseOn || rhVentOn) ? VENT_DUTY : 0;
 }
 
 void control() {
@@ -355,10 +376,13 @@ void control() {
   int ventReq = ventManual ? ventOverrideDuty : ventAutoDuty(now);
   int circReq = circManual ? circOverrideDuty : circAutoDuty(fogOn, ventReq > 0);
 
-  // ===== 5b) OVERHEAT PANIC — dump heat: vent full + max air movement =====
-  // Beats manual and the ambient guard; heat removal is the only priority up here.
-  // (Heater is already locked off above; fog keeps cooling unless it hit RH_CEILING.)
-  if (overheat) { ventReq = VENT_DUTY; circReq = CIRC_FOG_DUTY; }
+  // ===== 5b) EMERGENCY BACKSTOP — only at a true runaway temp =====
+  // Normal high-temp cooling is the vent hysteresis (VENT_TEMP_ON_F) + fog. This forces
+  // the vent full OVER a manual hold only past VENT_EMERGENCY_F, so "vent less" can't
+  // become "no protection" if fog fails on a brutal spike while unattended. Rarely fires
+  // (the 94° hysteresis already has the vent full by here); it just adds override-manual.
+  // (Heater is already locked off at TEMP_SAFETY_F above; circ rides full with the vent.)
+  if (sensorsValid && ctrlTempF >= VENT_EMERGENCY_F) { ventReq = VENT_DUTY; circReq = CIRC_FOG_DUTY; }
 
   writeCirc(circReq);
   writeVent(ventReq);

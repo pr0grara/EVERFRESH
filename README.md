@@ -156,20 +156,32 @@ Three speed regimes:
 ### Cooling ladder (temperature-reactive)
 Cooling escalates with canopy temperature; everything is hysteretic (no chatter). The
 chamber runs *cold* most of the day, so these only fire during the afternoon solar
-spike — temperature is effectively the schedule.
+spike — temperature is effectively the schedule. **Fog is the primary cooler; the vent
+is a peak-shaver, not a continuous cooler** (see the 6/20 finding below).
 
 | Canopy temp | Response |
 |-------------|----------|
-| ≥ `COOL_ON_F` (84 °F) | **Fog** — evaporative cooling + restores the RH the heat spike steals (cut at `RH_CEILING`) |
-| ≥ `VENT_TEMP_ON_F` (86 °F) | **Vent** adds (primary heat-*energy* removal) **+ circ to full** |
-| ≥ `TEMP_SAFETY_F` (92 °F) | **Panic**: vent + circ forced full (beats manual), heater hard-off |
+| ≥ `COOL_ON_F` (84 °F) | **Fog** — evaporative cooling that holds temp ~88–90 °F *and* keeps RH/VPD in band (cut at `RH_CEILING`) |
+| ≥ `VENT_TEMP_ON_F` (94 °F) | **Vent PULSES** to shave a peak fog can't hold — 1 min on / 3 min off (~25 % duty) so RH recovers between bursts **+ circ full while venting**; pulsing stops once back under `VENT_TEMP_OFF_F` (90 °F) |
+| ≥ `VENT_EMERGENCY_F` (99 °F) | **Emergency**: vent + circ forced full *over* a manual hold (runaway guard) |
+| ≥ `TEMP_SAFETY_F` (92 °F) | Heater hard-off + "hot" alarm (does **not** force the vent) |
+
+> **6/20 finding — why the vent runs so little.** A 3-minute vent-off test during a live
+> solar spike: temp barely moved (~88–90 °F on fog alone) but **VPD halved** (~2.5 → ~1.25
+> kPa) and RH jumped 45→75 %. Continuous venting was paying a huge drying penalty for
+> almost no cooling — so the vent now only wakes above 94 °F and hands straight back to
+> fog at 90 °F. We optimize **VPD**, with temperature as a safety ceiling.
 
 ### Vent fan (fresh-air exchange — on/off)
 On-demand only, since the leaky chamber already exchanges air passively:
-- **Cooling** (primary): vent if temp ≥ `VENT_TEMP_ON_F` (off below `VENT_TEMP_OFF_F`),
-  **but only when venting actually cools** — with a valid ambient reading it requires
-  `canopy − ambient ≥ VENT_AMBIENT_DELTA_F` (3 °F). Until the ambient sensor is
+- **Cooling** (peak-shave): vent if temp ≥ `VENT_TEMP_ON_F` (94 °F, off below
+  `VENT_TEMP_OFF_F` 90 °F) — wide hysteresis so it dips a peak then gets out of fog's way.
+  Also gated on **whether venting actually cools** — with a valid ambient reading it
+  requires `canopy − ambient ≥ VENT_AMBIENT_DELTA_F` (3 °F). Until the ambient sensor is
   installed the guard is skipped (the room is known cooler than the sunlit tent).
+- **Emergency backstop**: at `VENT_EMERGENCY_F` (99 °F) the vent is forced full *over* a
+  manual hold — the only always-on protection if fog fails unattended (manual overrides
+  auto-expire in ≤10 min anyway).
 - **High-RH safety**: vent if RH ≥ `VENT_RH_ON` (off below `VENT_RH_OFF`) — an
   independent humidity-*down* relief valve near saturation, *not* ambient-gated.
 - **Scheduled exchange** (`VENT_DURATION_MS` every `VENT_INTERVAL_MS`) is gated by
@@ -182,8 +194,9 @@ On-demand only, since the leaky chamber already exchanges air passively:
 
 - **No blind heating** — if the canopy sensor is invalid, heater + fogger forced OFF,
   `ALARM` published.
-- **Hard thermal cutoff** at `TEMP_SAFETY_F` — heater off *and* vent + circ forced to
-  full to dump heat, overriding any manual hold.
+- **Hard thermal cutoff** at `TEMP_SAFETY_F` (92 °F) — heater off + "hot" alarm.
+- **Emergency vent backstop** at `VENT_EMERGENCY_F` (99 °F) — vent + circ forced full
+  *over* a manual hold (runaway protection if fog can't hold a spike unattended).
 - **Watchdog** resets the board if `loop()` hangs > 60 s.
 - **Known-safe boot** — all loads off before anything else.
 - **Min on/off timers** on heater (60 s) and fogger (20 s).
@@ -200,7 +213,7 @@ On-demand only, since the leaky chamber already exchanges air passively:
 |----------|---------|---------|
 | `RELAY_ACTIVE_LOW` | `false` | `false` = active-HIGH (SSR/MOSFET) |
 | `HEAT_ON_F` / `HEAT_OFF_F` | 76 / 78.5 | Heater band |
-| `TEMP_SAFETY_F` | 92 | Heater hard-off |
+| `TEMP_SAFETY_F` | 92 | Heater hard-off + "hot" alarm |
 | `COOL_ON_F` / `COOL_OFF_F` | 84 / 82 | Fog-for-cooling band |
 | `RH_FOG_ON` / `RH_FOG_OFF` | 65 / 80 | Fog (humidity) band |
 | `RH_CEILING` | 90 | Never fog above |
@@ -211,7 +224,9 @@ On-demand only, since the leaky chamber already exchanges air passively:
 | `VENT_SCHEDULE_ENABLED` | `false` | Periodic exchange on/off — off while chamber is leaky |
 | `VENT_DUTY` | 100 | Vent on/off (on=full) |
 | `VENT_INTERVAL_MS` / `_DURATION_MS` | 120 / 2 min | Periodic exchange (when enabled) |
-| `VENT_TEMP_ON_F` / `_OFF_F` | 86 / 82 | Vent-to-cool band |
+| `VENT_TEMP_ON_F` / `_OFF_F` | 94 / 90 | Vent-to-cool band (wide — peak-shave only; fog holds 84–94) |
+| `VENT_PULSE_ON_MS` / `_OFF_MS` | 1 / 3 min | Cool-vent pulse: on/off duty above 94 °F (~25 %) |
+| `VENT_EMERGENCY_F` | 99 | Force vent full over manual (runaway backstop) |
 | `VENT_RH_ON` / `_OFF` | 88 / 80 | Vent-to-shed-humidity band |
 | `VENT_AMBIENT_DELTA_F` | 3 | Min canopy − ambient gap to vent-cool (skipped w/o ambient sensor) |
 | `HEAT_MIN_ON/OFF`, `FOG_MIN_ON/OFF` | 60s / 20s | Anti-chatter |
