@@ -60,8 +60,8 @@ const float COOL_OFF_F    = 82.0;   // fog-for-cooling OFF below this
 
 // --- Humidity setpoints (%RH) ---  target band 50–80
 const float RH_FOG_ON  = 65.0;   // fog (humidity) ON below this
-const float RH_FOG_OFF = 80.0;   // fog OFF above this
-const float RH_CEILING = 90.0;   // never fog above this
+const float RH_FOG_OFF = 90.0;   // fog OFF above this
+const float RH_CEILING = 95.0;   // never fog above this
 
 // --- Circulation fan (internal mixing; no fresh air) ---
 const int CIRC_FOG_DUTY = 100;   // % while fogging (disperse mist)
@@ -102,7 +102,8 @@ const float VENT_EMERGENCY_F = 99.0; // hard backstop: force vent full OVER manu
 // The vent is binary (no PWM), so time-pulsing is the only way to get a fractional duty.
 const unsigned long VENT_PULSE_ON_MS  =  60UL * 1000;  // vent 1 min...
 const unsigned long VENT_PULSE_OFF_MS = 180UL * 1000;  // ...then off 3 min, repeat
-const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this
+const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this...
+const unsigned long VENT_RH_DWELL_MS = 5UL * 60 * 1000;  // ...but only if held >=5 min
 const float VENT_RH_OFF     = 80.0;
 // Vent only cools if it pulls in cooler air. With a valid ambient reading, require the
 // canopy to be at least this much hotter than the room before venting to cool. Until
@@ -145,6 +146,7 @@ bool tempVentOn = false, rhVentOn = false;
 unsigned long lastControl = 0, lastPublish = 0;
 unsigned long ventCycleStart = 0;
 unsigned long ventPulseStart = 0;   // anchors the cool-vent ON/OFF pulse to peak entry
+unsigned long rhHighSince = 0;      // when RH first crossed VENT_RH_ON (0 = not high); gates the dwell
 
 // Manual overrides — while *Until is in the future, that actuator is forced.
 unsigned long heatOverrideUntil = 0; bool heatOverrideOn  = false;
@@ -408,11 +410,18 @@ int ventAutoDuty(unsigned long now) {
       unsigned long period = VENT_PULSE_ON_MS + VENT_PULSE_OFF_MS;
       coolPulseOn = ((now - ventPulseStart) % period) < VENT_PULSE_ON_MS;
     }
-    // RH-relief: independent humidity safety valve (last resort — open the box). Continuous.
-    if (!rhVentOn && ctrlRH >= VENT_RH_ON)   rhVentOn = true;
-    else if (rhVentOn && ctrlRH <= VENT_RH_OFF) rhVentOn = false;
+    // RH-relief: humidity safety valve (last resort — open the box). Only opens once RH
+    // has stayed at/above VENT_RH_ON for VENT_RH_DWELL_MS, so brief spikes (e.g. a fog
+    // burst) are ignored. Exit hysteresis: keep venting until RH falls under VENT_RH_OFF.
+    if (ctrlRH >= VENT_RH_ON) {
+      if (rhHighSince == 0) rhHighSince = now;                  // start the dwell clock
+      if (now - rhHighSince >= VENT_RH_DWELL_MS) rhVentOn = true;
+    } else {
+      rhHighSince = 0;                                          // sustained-high broken → reset
+      if (rhVentOn && ctrlRH <= VENT_RH_OFF) rhVentOn = false;
+    }
   } else {
-    tempVentOn = false; rhVentOn = false;
+    tempVentOn = false; rhVentOn = false; rhHighSince = 0;
   }
 
   return (exchangeWindow || coolPulseOn || rhVentOn) ? VENT_DUTY : 0;
