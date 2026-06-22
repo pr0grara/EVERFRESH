@@ -75,8 +75,10 @@ def parse_points(rows):
     sheets-logger.gs schema (vpd_kpa) and the older deployed sheet (VPD)."""
     pts = []
     for row in rows:
-        t = _get(row, "tempF")
-        h = _get(row, "rh")
+        # Canopy is the control point we chart. Names listed newest-first so this
+        # works across the rename (canopy* now, bare tempF/rh/VPD on older rows).
+        t = _get(row, "canopyTempF", "tempF")
+        h = _get(row, "canopyRH", "rh")
         if not t or not h:
             continue
         try:
@@ -84,7 +86,7 @@ def parse_points(rows):
         except ValueError:
             continue
         try:
-            vpd = float(_get(row, "VPD", "vpd_kpa", "vpd"))
+            vpd = float(_get(row, "canopyVPD", "VPD", "vpd_kpa", "vpd"))
         except ValueError:
             vpd = float("nan")
         try:

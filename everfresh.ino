@@ -2,9 +2,11 @@
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
- * Sensors : 2x SHT31 over I2C
- *   canopy  @ 0x44  — the CONTROL POINT (all decisions use this)
- *   ambient @ 0x45  — reference + gates vent cooling (room air the vent pulls in)
+ * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
+ *   canopy  @ hardware I2C (D0/D1) — the CONTROL POINT (all decisions use this)
+ *   ambient @ software I2C (D5/D6) — reference + gates vent cooling. On its own
+ *           bit-banged bus because the sealed waterproof module is fixed at 0x44,
+ *           same as the canopy sensor, so the two cannot share one bus.
  * Actuators:
  *   HEAT  — 120VAC heater via SSR                    (on/off, D2)
  *   FOG   — 24VDC ultrasonic fogger transducer/MOSFET (on/off, D3)
@@ -39,9 +41,15 @@ const int PIN_CIRC_PWR = D4;   // circ fan power MOSFET — true on/off
 const int PIN_VENT     = A4;   // vent fan (2-wire) MOSFET — on/off
 const int FAN_PWM_FREQ = 25000;   // 25kHz PWM into the circ fan's control wire
 
-// --- I2C sensor addresses (ADDR pin: low=0x44, high=0x45) ---
+// Ambient sensor's dedicated software-I2C bus (see sensor section). Both pins need
+// a pull-up (4.7k–10k) to 3.3V; most SHT31 breakouts include them onboard.
+const int PIN_AMB_SDA  = D5;   // ambient SHT31 — software I2C data
+const int PIN_AMB_SCL  = D6;   // ambient SHT31 — software I2C clock
+
+// --- I2C sensor addresses --- both SHT31s are fixed at 0x44; they don't collide
+// because each lives on its own bus (canopy on hardware Wire, ambient bit-banged).
 const uint8_t ADDR_CANOPY  = 0x44;
-const uint8_t ADDR_AMBIENT = 0x45;
+const uint8_t ADDR_AMBIENT = 0x44;
 
 // --- Temperature setpoints (°F) ---  target band 75–85
 const float HEAT_ON_F     = 76.0;   // heater ON below this
@@ -236,12 +244,98 @@ bool sht31Read(uint8_t addr, float &tempC, float &rh) {
   return true;
 }
 
+// ---- software (bit-banged) I2C for the ambient sensor ----
+// Open-drain emulation: a line is pulled LOW by driving the pin as an output, and
+// released HIGH by switching it to a high-impedance input (the external pull-up
+// raises it). ~100 kHz. The SHT31 is read in no-clock-stretch mode, so the master
+// owns the clock; swSclHigh still tolerates brief stretching with a timeout.
+inline void swDelay()   { delayMicroseconds(5); }
+inline void swSdaHigh() { pinMode(PIN_AMB_SDA, INPUT); }
+inline void swSdaLow()  { digitalWrite(PIN_AMB_SDA, LOW); pinMode(PIN_AMB_SDA, OUTPUT); }
+inline void swSclLow()  { digitalWrite(PIN_AMB_SCL, LOW); pinMode(PIN_AMB_SCL, OUTPUT); }
+inline void swSclHigh() {
+  pinMode(PIN_AMB_SCL, INPUT);
+  for (int i = 0; i < 1000 && digitalRead(PIN_AMB_SCL) == LOW; i++) delayMicroseconds(1);
+}
+
+void swI2CInit() {            // idle bus = both lines released high
+  swSdaHigh();
+  swSclHigh();
+}
+
+void swStart() {             // SDA falls while SCL is high
+  swSdaHigh(); swSclHigh(); swDelay();
+  swSdaLow();  swDelay();
+  swSclLow();  swDelay();
+}
+
+void swStop() {              // SDA rises while SCL is high
+  swSdaLow();  swDelay();
+  swSclHigh(); swDelay();
+  swSdaHigh(); swDelay();
+}
+
+bool swWrite(uint8_t b) {    // returns true if the slave ACKed
+  for (int i = 0; i < 8; i++) {
+    if (b & 0x80) swSdaHigh(); else swSdaLow();
+    swDelay();
+    swSclHigh(); swDelay();
+    swSclLow();  swDelay();
+    b <<= 1;
+  }
+  swSdaHigh();               // release SDA so the slave can drive the ACK bit
+  swDelay();
+  swSclHigh(); swDelay();
+  bool ack = (digitalRead(PIN_AMB_SDA) == LOW);
+  swSclLow();  swDelay();
+  return ack;
+}
+
+uint8_t swRead(bool ack) {   // ack=true -> ACK (more bytes), false -> NACK (last byte)
+  uint8_t b = 0;
+  swSdaHigh();               // let the slave drive the data line
+  for (int i = 0; i < 8; i++) {
+    swDelay();
+    swSclHigh(); swDelay();
+    b = (uint8_t)((b << 1) | (digitalRead(PIN_AMB_SDA) ? 1 : 0));
+    swSclLow();
+  }
+  if (ack) swSdaLow(); else swSdaHigh();
+  swDelay();
+  swSclHigh(); swDelay();
+  swSclLow();  swDelay();
+  swSdaHigh();
+  return b;
+}
+
+// Single-shot, high-repeatability, no clock stretching (cmd 0x2400) over software I2C.
+bool sht31ReadSW(uint8_t addr, float &tempC, float &rh) {
+  swStart();
+  if (!swWrite((uint8_t)(addr << 1)))       { swStop(); return false; }  // write
+  if (!swWrite(0x24))                        { swStop(); return false; }
+  if (!swWrite(0x00))                        { swStop(); return false; }
+  swStop();
+  delay(20);
+  swStart();
+  if (!swWrite((uint8_t)((addr << 1) | 1)))  { swStop(); return false; }  // read
+  uint8_t d[6];
+  for (int i = 0; i < 6; i++) d[i] = swRead(i < 5);   // ACK first 5, NACK the last
+  swStop();
+  if (sht31Crc(&d[0]) != d[2]) return false;
+  if (sht31Crc(&d[3]) != d[5]) return false;
+  uint16_t rawT = (d[0] << 8) | d[1];
+  uint16_t rawH = (d[3] << 8) | d[4];
+  tempC = -45.0 + 175.0 * ((float)rawT / 65535.0);
+  rh    = 100.0 * ((float)rawH / 65535.0);
+  return true;
+}
+
 void readSensors() {
   float c, h;
-  if (sht31Read(ADDR_CANOPY, c, h))  { float f = cToF(c); canopy  = { f, h, valid(f, h) }; }
-  else                               { canopy  = { NAN, NAN, false }; }
-  if (sht31Read(ADDR_AMBIENT, c, h)) { float f = cToF(c); ambient = { f, h, valid(f, h) }; }
-  else                               { ambient = { NAN, NAN, false }; }
+  if (sht31Read(ADDR_CANOPY, c, h))    { float f = cToF(c); canopy  = { f, h, valid(f, h) }; }
+  else                                 { canopy  = { NAN, NAN, false }; }
+  if (sht31ReadSW(ADDR_AMBIENT, c, h)) { float f = cToF(c); ambient = { f, h, valid(f, h) }; }
+  else                                 { ambient = { NAN, NAN, false }; }
 
   // Canopy is the sole control point.
   if (canopy.ok) { ctrlTempF = canopy.tempF; ctrlRH = canopy.rh; sensorsValid = true; }
@@ -528,7 +622,8 @@ void setup() {
   writeCirc(0);   // circ MOSFET off + PWM 0
   writeVent(0);   // vent MOSFET off
 
-  Wire.begin();   // both SHT31s read via the inline driver
+  Wire.begin();   // canopy SHT31 on the hardware bus
+  swI2CInit();    // ambient SHT31 on its dedicated software bus (D5/D6)
 
   Particle.variable("canopyTempF",  cloudCanopyT);
   Particle.variable("canopyRH",     cloudCanopyRH);

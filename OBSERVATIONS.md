@@ -9,6 +9,15 @@ control logic). Plant-behavior cues here are as valuable as the sensor data.
 
 ## 2026-06-21
 
+- **Overcast day = muted danger window (a natural "rest" day).** Direct A/B vs the
+  cloudless 6/20 (peak 93 °F, VPD 2.5): 6/21 peaked only **~84 °F**, VPD capped **~1.3 kPa**.
+  The **vent never fired** (temp never reached the 94 °F trigger) and the fogger handled
+  the whole warm-but-controlled afternoon solo — dense fog sawtooth ~3:30–7 PM, **no RH
+  crash**. Two takeaways: (1) validates the peak-shaver vent design on a *normal* day —
+  it correctly stayed asleep; (2) natural cloud cover gives a built-in stress/rest rhythm
+  (hammer on sunny days, recover on cloudy ones), and the overcast afternoon sat right in
+  the hardening sweet spot (~84 °F, VPD ~1.0–1.3). Confirms the west-window sun is *the*
+  load driver — remove it (clouds) and the spike vanishes.
 - **The youngest leaf is the most sensitive gauge.** Its pinnae open *first* in the
   morning (tips first, ~8:30) and are also *first to close* under stress. Young tissue
   has the most responsive pulvini + the plant protects its newest growth first → it

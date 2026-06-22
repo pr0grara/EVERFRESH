@@ -16,6 +16,16 @@
 
 var SHEET_ID = '11bLXCx34tZWXnYe-mk9Jl52WSTpmxNaIX0cW2fmCqa8';
 
+// Column layout for the "log" sheet. Order is fixed (appendRow below matches it);
+// adding columns at the END keeps old rows aligned. syncHeader() rewrites row 1 to
+// match this on every post, so renames/additions land on an existing sheet without
+// clearing it.
+var HEADERS = ['published_at', 'date_time', 'event',
+               'canopyTempF', 'canopyRH', 'canopyVPD',
+               'ambientTempF', 'ambientRH', 'ambientVPD',
+               'heat', 'fog', 'circ', 'vent', 'mode',
+               'change', 'state', 'raw'];
+
 // Your timezone — a named zone so daylight-saving is handled automatically.
 // (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
 var TZ = 'America/Los_Angeles';
@@ -37,6 +47,19 @@ function computeVPD(tempF, rh) {
   return Math.round((svpLeaf - avp) * 100) / 100;   // kPa, 2 decimals
 }
 
+// Ensure row 1 matches HEADERS. Writes them on an empty sheet, and overwrites row 1
+// in place when labels/width differ (e.g. after a rename) — column order is
+// unchanged, so data rows below stay aligned; newly added columns just leave blanks
+// in historical rows.
+function syncHeader(sheet) {
+  var width = HEADERS.length;
+  var current = sheet.getLastRow() === 0 ? []
+              : sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var same = current.length === width &&
+             HEADERS.every(function (h, i) { return current[i] === h; });
+  if (!same) sheet.getRange(1, 1, 1, width).setValues([HEADERS]);
+}
+
 function doPost(e) {
   try {
     // Particle's default webhook body: { event|name, data, published_at, coreid }.
@@ -52,13 +75,7 @@ function doPost(e) {
     var ss = SpreadsheetApp.openById(SHEET_ID);   // robust whether bound or standalone
     var sheet = ss.getSheetByName('log') || ss.insertSheet('log');
 
-    if (sheet.getLastRow() === 0) {
-      sheet.appendRow(['published_at', 'local', 'event',
-                       'tempF', 'rh', 'vpd_kpa',
-                       'atempF', 'arh', 'avpd_kpa',
-                       'heat', 'fog', 'circ', 'vent', 'mode',
-                       'change', 'state', 'raw']);
-    }
+    syncHeader(sheet);
 
     // Readable local time, DST-correct via the named zone. -> "6/18 2:58PM"
     var local = '';
