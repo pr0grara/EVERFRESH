@@ -126,11 +126,12 @@ const unsigned long OVERRIDE_MAX_S     = 600;
 // --- Humidity control mode (RUNTIME-selectable; the "guide back") ---
 // 0 = original RH bang-bang (RH_FOG_ON/OFF)   — most conservative fallback
 // 1 = diurnal VPD bang-bang (vpdWantFog/vpdWantDryVent)
-// 2 = moisture-regime-gated PI (dew-point gap + PI + dry-down)  — default
+// 2 = moisture-regime-gated PI (dew-point gap + PI + dry-down)
+// 3 = wide-hysteresis excursion bang-bang (regime-gated; overdry/overmoisten + rest) — default
 // Change live with the setControlMode cloud function (no reflash). Heat is NEVER driven
 // by humidity control in any mode (the temp loop owns it). See VPD_PI_CONTROL.md.
-int controlMode = 2;
-const int MODE_RH = 0, MODE_VPD_BANGBANG = 1, MODE_REGIME_PI = 2;
+int controlMode = 3;
+const int MODE_RH = 0, MODE_VPD_BANGBANG = 1, MODE_REGIME_PI = 2, MODE_EXCURSION = 3;
 
 // Cloud-time zone (America/Los_Angeles); base offset + explicit US DST (no TZ db on device).
 const int   TZ_BASE_OFFSET = -8;          // PST hours from UTC
@@ -184,6 +185,19 @@ const float VPD_VENT_MIN_EFFORT = 0.10;                // below this, don't open
 // exhaust the floor reservoir so drying isn't transitory.
 const float VPD_DRYDOWN_TRIGGER_KPA = 0.15;            // VPD this far below setpoint → engage pump
 const int   CIRC_DRYDOWN_DUTY = 35;                    // moderated circ during dry-down (== assist cap)
+
+// --- Wide-hysteresis excursion control (controlMode 3) --------------------------------
+// The hormetic alternative to the PI servo: instead of pinning VPD to the band midpoint
+// (which micro-cycles the vent every few seconds and never lets the plant settle), this
+// commits to ONE big, deliberate swing and then RESTS. Too wet → dry HARD until VPD
+// overshoots a fixed margin PAST the band's dry edge, then release and let it drift back
+// for a guaranteed rest plateau. Too dry → fog HARD until VPD overshoots past the wet
+// edge, then rest. Larger variance is the point (see GROW_PHILOSOPHY.md); the regime
+// interlock + below-room stop from mode 2 still pick the feasible lever. Heat untouched.
+const float EXC_OVERSHOOT_KPA   = 0.15;                // drive this far PAST the far band edge before resting
+const float EXC_TRIGGER_MARGIN  = 0.02;               // arm once VPD leaves the band by this (kPa)
+const unsigned long EXC_REST_MS     = 12UL * 60 * 1000;  // minimum rest plateau after a swing (no humidity servo)
+const unsigned long EXC_MAX_DRIVE_MS = 20UL * 60 * 1000; // safety: end an excursion that can't reach overshoot
 
 // ====================================================================
 
@@ -252,6 +266,13 @@ int    forcedRegime = -1;              // test override: -1=live, 0/1/2 = force 
 struct PIState { float integ; float fogEffort; float ventEffort; } piState = {0, 0, 0};
 unsigned long fogPiWin = 0, ventPiWin = 0;             // time-duty window anchors
 bool   ventBelowRoom = false;          // status flag: want to dry but gap≈0 (needs heat, can't)
+
+// Wide-hysteresis excursion state (controlMode 3)
+enum ExcState { EX_REST, EX_DRY, EX_MOIST };
+ExcState excState = EX_REST;           // latched: resting / drying-hard / moistening-hard
+unsigned long excDriveStart = 0;       // when the current swing began (max-drive safety clock)
+unsigned long excRestUntil  = 0;       // earliest time the next swing may arm (rest plateau)
+bool   excWantVent = false, excWantFog = false;   // this cycle's humidity-servo demands
 double cloudCanopyDP = 0, cloudAmbientDP = 0, cloudDpGap = 0;   // telemetry mirrors
 
 // Watchdog: reset if loop() hangs >60s.
@@ -551,6 +572,11 @@ void resolvePhase() {
 
 // ---- moisture-regime-gated PI (controlMode 2) ----
 const char* regimeName(Regime r) { return r == RG_WET ? "WET" : (r == RG_DRY ? "DRY" : "NEUTRAL"); }
+// Excursion phase for telemetry; "" unless mode 3 is active.
+const char* excTag() {
+  if (controlMode != MODE_EXCURSION) return "";
+  return excState == EX_DRY ? " ex=DRYING" : (excState == EX_MOIST ? " ex=MOIST" : " ex=REST");
+}
 
 // Classify the moisture regime from the inside-outside dew-point gap, dual hysteresis.
 // WET = chamber water-loaded (venting exports moisture, fog unsafe); DRY = room ~as wet
@@ -626,6 +652,50 @@ bool vpdWantDryDown() {
   if (vpd < 0) return false;
   float sp = (vpdTargetLo + vpdTargetHi) / 2.0;
   return (sp - vpd) >= VPD_DRYDOWN_TRIGGER_KPA;
+}
+
+// Wide-hysteresis excursion controller (controlMode 3). One deliberate swing, then rest:
+// commit to drying (or fogging) HARD until VPD overshoots a fixed margin past the FAR band
+// edge, then drop the humidity servo for a guaranteed rest plateau and let VPD drift back.
+// Same regime interlock + below-room stop as mode 2 choose the feasible lever; heat untouched.
+// Sets excWantVent/excWantFog for this cycle and mirrors them into veff/feff for telemetry.
+void excursionUpdate() {
+  unsigned long now = millis();
+  excWantVent = false; excWantFog = false; ventBelowRoom = false;
+  if (!sensorsValid) { excState = EX_REST; piState.ventEffort = 0; piState.fogEffort = 0; return; }
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  if (vpd < 0) { excState = EX_REST; piState.ventEffort = 0; piState.fogEffort = 0; return; }
+
+  float bandLo = vpdTargetLo, bandHi = vpdTargetHi;
+  // Lever feasibility — identical interlocks to the PI mode. Venting can only export moisture
+  // while the room is drier (dpGap > 0); fog is unsafe when water-loaded or already at the ceiling.
+  float ventAuth = dpGapValid ? constrainf(dpGap / DPGAP_VENT_FULL_F, 0.0, 1.0) : 0.0;
+  bool  canVent  = (curRegime != RG_DRY) && (ventAuth > 0.0);
+  bool  canFog   = (curRegime != RG_WET) && (ctrlRH < RH_CEILING);
+
+  switch (excState) {
+    case EX_DRY:   // drive until VPD overshoots PAST the dry edge, else the lever quit or timed out
+      if (vpd >= bandHi + EXC_OVERSHOOT_KPA) { excState = EX_REST; excRestUntil = now + EXC_REST_MS; }
+      else if (!canVent || (now - excDriveStart) >= EXC_MAX_DRIVE_MS) {
+        if (!canVent && curRegime != RG_DRY) ventBelowRoom = true;   // wanted to dry but gap≈0 → needs heat
+        excState = EX_REST; excRestUntil = now + EXC_REST_MS;
+      } else excWantVent = true;
+      break;
+    case EX_MOIST: // drive until VPD overshoots PAST the wet edge, else fog became infeasible / timed out
+      if (vpd <= bandLo - EXC_OVERSHOOT_KPA || !canFog || (now - excDriveStart) >= EXC_MAX_DRIVE_MS) {
+        excState = EX_REST; excRestUntil = now + EXC_REST_MS;
+      } else excWantFog = true;
+      break;
+    default:       // EX_REST: humidity servo OFF, VPD drifts. Re-arm only after the rest plateau.
+      if (now >= excRestUntil) {
+        if      (vpd < bandLo - EXC_TRIGGER_MARGIN && canVent) { excState = EX_DRY;   excDriveStart = now; excWantVent = true; }
+        else if (vpd < bandLo - EXC_TRIGGER_MARGIN && curRegime != RG_DRY) ventBelowRoom = true;  // too wet, can't vent
+        else if (vpd > bandHi + EXC_TRIGGER_MARGIN && canFog)  { excState = EX_MOIST; excDriveStart = now; excWantFog  = true; }
+      }
+      break;
+  }
+  piState.ventEffort = excWantVent ? 1.0 : 0.0;   // reuse veff/feff telemetry for the active lever
+  piState.fogEffort  = excWantFog  ? 1.0 : 0.0;
 }
 
 // Desired fog state from the active canopy VPD band. Fog LOWERS VPD; heat is never touched
@@ -745,7 +815,8 @@ int ventAutoDuty(unsigned long now) {
   // Humidity dry-vent: mode 2 = regime-gated PI effort (time-duty); mode 1 = legacy pulse;
   // mode 0 = none. (piState efforts are refreshed in control() before this runs.)
   bool dryVentOn = false;
-  if      (controlMode == MODE_REGIME_PI)    dryVentOn = piPulseOn(piState.ventEffort, VPD_VENT_MIN_EFFORT, ventPiWin, now);
+  if      (controlMode == MODE_EXCURSION)    dryVentOn = excWantVent;
+  else if (controlMode == MODE_REGIME_PI)    dryVentOn = piPulseOn(piState.ventEffort, VPD_VENT_MIN_EFFORT, ventPiWin, now);
   else if (controlMode == MODE_VPD_BANGBANG) dryVentOn = vpdWantDryVent(now);
 
   return (exchangeWindow || coolPulseOn || rhVentOn || dryVentOn) ? VENT_DUTY : 0;
@@ -755,7 +826,8 @@ void control() {
   unsigned long now = millis();
   resolvePhase();   // updates curPhase / sunDetected / vpdTargetLo,Hi for the VPD layer
   resolveRegime();  // moisture regime from the dew-point gap (drives the mode-2 interlock)
-  if (controlMode == MODE_REGIME_PI) vpdPIUpdate();   // refresh PI fog + dry-vent efforts
+  if      (controlMode == MODE_REGIME_PI) vpdPIUpdate();    // refresh PI fog + dry-vent efforts
+  else if (controlMode == MODE_EXCURSION) excursionUpdate(); // refresh excursion lever demands
   bool overheat = sensorsValid && (ctrlTempF >= TEMP_SAFETY_F);
 
   // ===== 1) AUTOMATIC heat/fog decisions (hysteresis) =====
@@ -766,7 +838,12 @@ void control() {
     else if (heatOn  && ctrlTempF > HEAT_OFF_F) autoHeat = false;
     else                                        autoHeat = heatOn;
 
-    if (controlMode == MODE_REGIME_PI) {
+    if (controlMode == MODE_EXCURSION) {
+      // Excursion fog demand (moistening swing). Temp-cooling still overrides up; ceiling down.
+      autoFog = excWantFog;
+      if (ctrlTempF > COOL_ON_F) autoFog = true;
+      if (ctrlRH >= RH_CEILING)  autoFog = false;
+    } else if (controlMode == MODE_REGIME_PI) {
       // PI fog effort → time-duty. Regime interlock already zeroed fogEffort in WET. Temp-
       // cooling demand still overrides upward; RH ceiling stays a hard wet backstop.
       autoFog = piPulseOn(piState.fogEffort, VPD_FOG_MIN_EFFORT, fogPiWin, now);
@@ -818,7 +895,15 @@ void control() {
 
   // ===== 5) fans — vent first (primary heat removal), then circ moves air to it =====
   int ventReq = ventManual ? ventOverrideDuty : ventAutoDuty(now);
-  int circReq = circManual ? circOverrideDuty : circAutoDuty(fogOn, ventReq > 0, vpdWantDryDown());
+  // Mode-3 dry excursion: hold circ at the idle mix floor instead of letting the vent ramp it
+  // to 100%. Forced convection over the standing floor water evaporates it straight back into
+  // the air (RH up, VPD down — worst at night), fighting the excursion. Let the vent dry; circ
+  // just idles at the mold-safe floor. (Fog still wins for mist dispersion if temp-cooling fires.)
+  bool excDrying = (controlMode == MODE_EXCURSION && excState == EX_DRY);
+  int circReq;
+  if      (circManual)          circReq = circOverrideDuty;
+  else if (excDrying && !fogOn)  circReq = CIRC_MIX_DUTY;
+  else                           circReq = circAutoDuty(fogOn, ventReq > 0, vpdWantDryDown());
 
   // ===== 5b) EMERGENCY BACKSTOP — only at a true runaway temp =====
   // Normal high-temp cooling is the vent hysteresis (VENT_TEMP_ON_F) + fog. This forces
@@ -841,14 +926,14 @@ void control() {
       heatOn ? "ON":"off", fogOn ? "ON":"off", circReq, ventReq, cloudMode);
   } else {
     snprintf(cloudStatus, sizeof(cloudStatus),
-      "T=%.1fF RH=%.0f%% VPD=%.2f | heat=%s fog=%s circ=%d%% vent=%d%% [%s] m%d %s gap=%.1f %s→%.2f%s%s%s%s",
+      "T=%.1fF RH=%.0f%% VPD=%.2f | heat=%s fog=%s circ=%d%% vent=%d%% [%s] m%d %s gap=%.1f %s→%.2f%s%s%s%s%s",
       ctrlTempF, ctrlRH, cloudVPD,
       heatOn ? "ON":"off", fogOn ? "ON":"off", circReq, ventReq, cloudMode,
       controlMode, regimeName(curRegime), cloudDpGap,
       phaseName(curPhase), cloudVpdTarget, sunDetected ? "(sun)" : "",
       overheat ? " OVERHEAT" : "",
       (ctrlRH >= RH_CEILING) ? " RH-ceiling" : "",
-      ventBelowRoom ? " BELOW-ROOM" : "");
+      ventBelowRoom ? " BELOW-ROOM" : "", excTag());
   }
 }
 
@@ -928,14 +1013,15 @@ int fnSetPhase(String arg) {
   Particle.publish("everfresh/cmd", String::format("phase %d sun=%d", forcedPhase, forcedSun ? 1 : 0), PRIVATE);
   return forcedPhase;
 }
-// setControlMode("0|1|2") -> 0 RH bang-bang, 1 VPD bang-bang, 2 regime-PI. The "guide back":
-// flip to 1 or 0 live (no reflash) if the regime-PI layer misbehaves. See VPD_PI_CONTROL.md.
+// setControlMode("0|1|2|3") -> 0 RH bang-bang, 1 VPD bang-bang, 2 regime-PI, 3 excursion. The
+// "guide back": flip to 2/1/0 live (no reflash) if the excursion layer misbehaves. See VPD_PI_CONTROL.md.
 int fnSetControlMode(String arg) {
   arg.trim();
   int m = arg.toInt();
-  if (m < 0) m = 0; if (m > 2) m = 2;
+  if (m < 0) m = 0; if (m > 3) m = 3;
   controlMode = m;
   piState.integ = 0; piState.fogEffort = 0; piState.ventEffort = 0;   // clean handoff
+  excState = EX_REST; excRestUntil = 0; excWantVent = false; excWantFog = false;
   Particle.publish("everfresh/cmd", String::format("controlMode %d", controlMode), PRIVATE);
   return controlMode;
 }
