@@ -43,18 +43,23 @@ hormetic opposite** ([GROW_PHILOSOPHY.md](GROW_PHILOSOPHY.md)): it commits to on
 then rests. It's a latched 3-state machine on canopy VPD, `excursionUpdate()`:
 
 - **REST** — humidity servo OFF; VPD drifts. After the rest plateau (`EXC_REST_MS`, 12 min)
-  it re-arms: **too wet** (VPD < bandLo) and venting feasible → **DRY**; **too dry**
-  (VPD > bandHi) and fog feasible → **MOIST**.
+  it re-arms: **too wet** (VPD < bandLo) **and a real dew-point gap** (`dpGap ≥
+  EXC_DRY_ARM_GAP_F`, 2.5°F) → **DRY**; **too dry** (VPD > bandHi) and fog feasible → **MOIST**.
+  The dry-arm gate is stricter than `dpGap > 0`: without it, a near-equilibrium morning (room
+  ≈ as moist as the tent) launches a vent that churns for the full max-drive with zero gain
+  (observed 6/23). Too-wet-but-gap-too-small flags `BELOW-ROOM` and waits instead of venting.
 - **DRY** — vent runs *continuously* until VPD **overshoots** `bandHi + EXC_OVERSHOOT_KPA`
-  (overdried past the far edge), then → REST. Bails to REST if the gap closes (`BELOW-ROOM`,
-  can't dry without heat) or `EXC_MAX_DRIVE_MS` (20 min) trips. **Circ is held at the idle mix
+  (overdried past the far edge), then → REST. Bails to REST (flagged `BELOW-ROOM`) if the gap
+  closes, **the drive stalls** (VPD fails to rise `EXC_STALL_MIN_KPA` for `EXC_STALL_WINDOW_MS`
+  — the room-floor stop: you can't vent the canopy drier than the incoming air), or
+  `EXC_MAX_DRIVE_MS` (20 min) trips. **Circ is held at the idle mix
   floor while drying** (NOT ramped) — forced convection over the standing floor water
   re-evaporates it into the air (RH↑/VPD↓, worst at night) and fights the excursion. Unlike
   mode 2's dry-down (which ramps circ to evaporate+exhaust the reservoir), mode 3 lets the vent
   do the drying and leaves the floor alone. Fog still wins circ for mist dispersion if
   temp-cooling fires mid-excursion.
 - **MOIST** — fog runs continuously until VPD overshoots `bandLo − EXC_OVERSHOOT_KPA`, then →
-  REST. Bails on `RH_CEILING` or the drive timeout.
+  REST. Bails on `RH_CEILING`, a stall (fog can't lower VPD), or the drive timeout.
 
 Same regime interlock + vent-feasibility (`dpGap > 0`) as mode 2 pick the lever; heat is never
 touched. Net behavior: deliberate 20–45 min swings with real rest plateaus, instead of a
@@ -108,7 +113,10 @@ New JSON fields: `cm` (mode), `cdp`/`adp` (dew points), `dpgap`, `rg` (WET/NEUTR
 **Mode 3 (excursion):**
 - Swings too small / not enough stress → raise `EXC_OVERSHOOT_KPA` (further past the edge).
 - Rest plateau too short (re-fires too soon) → raise `EXC_REST_MS`.
-- Vent/fog runs too long chasing an unreachable overshoot → lower `EXC_MAX_DRIVE_MS`.
+- Vent/fog runs too long chasing an unreachable overshoot → lower `EXC_MAX_DRIVE_MS`, or
+  tighten the room-floor stop (lower `EXC_STALL_WINDOW_MS` / raise `EXC_STALL_MIN_KPA`).
+- Dry swings fire when the room is barely drier (futile vent) → raise `EXC_DRY_ARM_GAP_F`.
+- Dry swings never fire even on a genuinely dry room → lower `EXC_DRY_ARM_GAP_F`.
 - Arms on tiny edge noise → raise `EXC_TRIGGER_MARGIN`.
 - Vent leaves humid pockets while drying (circ too low to feed it) → raise the dry-excursion
   circ floor (`CIRC_MIX_DUTY`, or split out a dedicated knob). Default: circ idles so it doesn't

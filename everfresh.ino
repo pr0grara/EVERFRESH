@@ -198,6 +198,15 @@ const float EXC_OVERSHOOT_KPA   = 0.15;                // drive this far PAST th
 const float EXC_TRIGGER_MARGIN  = 0.02;               // arm once VPD leaves the band by this (kPa)
 const unsigned long EXC_REST_MS     = 12UL * 60 * 1000;  // minimum rest plateau after a swing (no humidity servo)
 const unsigned long EXC_MAX_DRIVE_MS = 20UL * 60 * 1000; // safety: end an excursion that can't reach overshoot
+// Don't START a dry swing unless the room is meaningfully drier — a positive dpGap isn't enough
+// (6/23: gap 1.7°F, ambient VPD ≈ canopy → vent churned near-equal air at 100% for the full
+// max-drive with zero gain). Continuation relies on canVent + the stall detector, so conditions
+// can soften mid-swing without re-arming into futility.
+const float EXC_DRY_ARM_GAP_F   = 2.5;                // min canopy−ambient dew-point gap (°F) to arm a dry swing
+// Room-floor stop: if VPD won't move toward the target (vent can't dry past the incoming air /
+// fog can't keep up), give up rather than run the lever wide-open to the max-drive timeout.
+const float EXC_STALL_MIN_KPA   = 0.03;               // VPD progress toward target that re-arms the stall clock
+const unsigned long EXC_STALL_WINDOW_MS = 6UL * 60 * 1000;  // no such progress this long → stalled, end the swing
 
 // ====================================================================
 
@@ -273,6 +282,8 @@ ExcState excState = EX_REST;           // latched: resting / drying-hard / moist
 unsigned long excDriveStart = 0;       // when the current swing began (max-drive safety clock)
 unsigned long excRestUntil  = 0;       // earliest time the next swing may arm (rest plateau)
 bool   excWantVent = false, excWantFog = false;   // this cycle's humidity-servo demands
+float  excStallVpd = 0;                // VPD anchor for the stall detector
+unsigned long excStallSince = 0;       // when the stall anchor was last set
 double cloudCanopyDP = 0, cloudAmbientDP = 0, cloudDpGap = 0;   // telemetry mirrors
 
 // Watchdog: reset if loop() hangs >60s.
@@ -654,6 +665,17 @@ bool vpdWantDryDown() {
   return (sp - vpd) >= VPD_DRYDOWN_TRIGGER_KPA;
 }
 
+// Stall detector for an excursion drive (the room-floor stop). Anchors VPD + time, and re-anchors
+// whenever VPD makes EXC_STALL_MIN_KPA of progress toward the target (rising while drying, falling
+// while moistening). If no such progress for EXC_STALL_WINDOW_MS, the lever can't move VPD any
+// further (vent already at the incoming-air floor, or fog can't keep up) → report stalled.
+void excResetStall(float vpd, unsigned long now) { excStallVpd = vpd; excStallSince = now; }
+bool excStalled(float vpd, unsigned long now, bool drying) {
+  float progress = drying ? (vpd - excStallVpd) : (excStallVpd - vpd);
+  if (progress >= EXC_STALL_MIN_KPA) { excResetStall(vpd, now); return false; }   // still working
+  return (now - excStallSince) >= EXC_STALL_WINDOW_MS;
+}
+
 // Wide-hysteresis excursion controller (controlMode 3). One deliberate swing, then rest:
 // commit to drying (or fogging) HARD until VPD overshoots a fixed margin past the FAR band
 // edge, then drop the humidity servo for a guaranteed rest plateau and let VPD drift back.
@@ -672,25 +694,29 @@ void excursionUpdate() {
   float ventAuth = dpGapValid ? constrainf(dpGap / DPGAP_VENT_FULL_F, 0.0, 1.0) : 0.0;
   bool  canVent  = (curRegime != RG_DRY) && (ventAuth > 0.0);
   bool  canFog   = (curRegime != RG_WET) && (ctrlRH < RH_CEILING);
+  // Stricter gate to START a dry swing: need a real dew-point gap, not just dpGap > 0, or the
+  // vent churns near-equal air to the max-drive timeout for nothing. Continuation uses canVent.
+  bool  armDry   = canVent && dpGapValid && (dpGap >= EXC_DRY_ARM_GAP_F);
 
   switch (excState) {
-    case EX_DRY:   // drive until VPD overshoots PAST the dry edge, else the lever quit or timed out
+    case EX_DRY:   // drive until VPD overshoots PAST the dry edge, else the lever quit / stalled / timed out
       if (vpd >= bandHi + EXC_OVERSHOOT_KPA) { excState = EX_REST; excRestUntil = now + EXC_REST_MS; }
-      else if (!canVent || (now - excDriveStart) >= EXC_MAX_DRIVE_MS) {
-        if (!canVent && curRegime != RG_DRY) ventBelowRoom = true;   // wanted to dry but gap≈0 → needs heat
+      else if (!canVent || excStalled(vpd, now, true) || (now - excDriveStart) >= EXC_MAX_DRIVE_MS) {
+        ventBelowRoom = true;                          // drying can't progress (at the room floor) → needs heat
         excState = EX_REST; excRestUntil = now + EXC_REST_MS;
       } else excWantVent = true;
       break;
-    case EX_MOIST: // drive until VPD overshoots PAST the wet edge, else fog became infeasible / timed out
-      if (vpd <= bandLo - EXC_OVERSHOOT_KPA || !canFog || (now - excDriveStart) >= EXC_MAX_DRIVE_MS) {
+    case EX_MOIST: // drive until VPD overshoots PAST the wet edge, else fog infeasible / stalled / timed out
+      if (vpd <= bandLo - EXC_OVERSHOOT_KPA || !canFog || excStalled(vpd, now, false)
+          || (now - excDriveStart) >= EXC_MAX_DRIVE_MS) {
         excState = EX_REST; excRestUntil = now + EXC_REST_MS;
       } else excWantFog = true;
       break;
     default:       // EX_REST: humidity servo OFF, VPD drifts. Re-arm only after the rest plateau.
       if (now >= excRestUntil) {
-        if      (vpd < bandLo - EXC_TRIGGER_MARGIN && canVent) { excState = EX_DRY;   excDriveStart = now; excWantVent = true; }
-        else if (vpd < bandLo - EXC_TRIGGER_MARGIN && curRegime != RG_DRY) ventBelowRoom = true;  // too wet, can't vent
-        else if (vpd > bandHi + EXC_TRIGGER_MARGIN && canFog)  { excState = EX_MOIST; excDriveStart = now; excWantFog  = true; }
+        if      (vpd < bandLo - EXC_TRIGGER_MARGIN && armDry) { excState = EX_DRY;   excDriveStart = now; excResetStall(vpd, now); excWantVent = true; }
+        else if (vpd < bandLo - EXC_TRIGGER_MARGIN && canVent) ventBelowRoom = true;  // too wet but gap too small to commit
+        else if (vpd > bandHi + EXC_TRIGGER_MARGIN && canFog) { excState = EX_MOIST; excDriveStart = now; excResetStall(vpd, now); excWantFog  = true; }
       }
       break;
   }
