@@ -203,10 +203,15 @@ const unsigned long EXC_MAX_DRIVE_MS = 20UL * 60 * 1000; // safety: end an excur
 // max-drive with zero gain). Continuation relies on canVent + the stall detector, so conditions
 // can soften mid-swing without re-arming into futility.
 const float EXC_DRY_ARM_GAP_F   = 2.5;                // min canopy−ambient dew-point gap (°F) to arm a dry swing
+// Arm dwell: the trigger condition must HOLD this long before committing to a swing, so a single
+// boot/RH transient can't kick one off (6/23: a 1-sample RH spike to ~67% armed a vent 30s after
+// flash). Same "sustained, not instantaneous" guard as the RH-relief vent / mode-1 dry-vent.
+const unsigned long EXC_ARM_DWELL_MS = 2UL * 60 * 1000;    // trigger must persist this long to arm a swing
 // Room-floor stop: if VPD won't move toward the target (vent can't dry past the incoming air /
-// fog can't keep up), give up rather than run the lever wide-open to the max-drive timeout.
+// fog can't keep up), give up rather than run the lever wide-open to the max-drive timeout. Judged
+// every control cycle (CONTROL_INTERVAL, 3s) — far finer than the telemetry's 60s log cadence.
 const float EXC_STALL_MIN_KPA   = 0.03;               // VPD progress toward target that re-arms the stall clock
-const unsigned long EXC_STALL_WINDOW_MS = 6UL * 60 * 1000;  // no such progress this long → stalled, end the swing
+const unsigned long EXC_STALL_WINDOW_MS = 1UL * 60 * 1000;  // no such progress this long → stalled, end the swing
 
 // ====================================================================
 
@@ -284,6 +289,7 @@ unsigned long excRestUntil  = 0;       // earliest time the next swing may arm (
 bool   excWantVent = false, excWantFog = false;   // this cycle's humidity-servo demands
 float  excStallVpd = 0;                // VPD anchor for the stall detector
 unsigned long excStallSince = 0;       // when the stall anchor was last set
+unsigned long excArmSince = 0;         // dwell clock: when the arm trigger first became true (0 = not pending)
 double cloudCanopyDP = 0, cloudAmbientDP = 0, cloudDpGap = 0;   // telemetry mirrors
 
 // Watchdog: reset if loop() hangs >60s.
@@ -712,11 +718,22 @@ void excursionUpdate() {
         excState = EX_REST; excRestUntil = now + EXC_REST_MS;
       } else excWantFog = true;
       break;
-    default:       // EX_REST: humidity servo OFF, VPD drifts. Re-arm only after the rest plateau.
+    default:       // EX_REST: humidity servo OFF, VPD drifts. Re-arm only after the rest plateau,
+                   // AND only once the trigger HOLDS for EXC_ARM_DWELL_MS — so a boot/RH transient
+                   // on a single sample can't kick off a swing (cf. v1.0.6 "sustained, not instant").
       if (now >= excRestUntil) {
-        if      (vpd < bandLo - EXC_TRIGGER_MARGIN && armDry) { excState = EX_DRY;   excDriveStart = now; excResetStall(vpd, now); excWantVent = true; }
-        else if (vpd < bandLo - EXC_TRIGGER_MARGIN && canVent) ventBelowRoom = true;  // too wet but gap too small to commit
-        else if (vpd > bandHi + EXC_TRIGGER_MARGIN && canFog) { excState = EX_MOIST; excDriveStart = now; excResetStall(vpd, now); excWantFog  = true; }
+        bool wantDry   = (vpd < bandLo - EXC_TRIGGER_MARGIN);
+        bool wantMoist = (vpd > bandHi + EXC_TRIGGER_MARGIN);
+        if (wantDry && armDry) {                          // water-loaded + real gap → arm a dry swing after the dwell
+          if (excArmSince == 0) excArmSince = now;
+          if (now - excArmSince >= EXC_ARM_DWELL_MS) { excState = EX_DRY;   excDriveStart = now; excResetStall(vpd, now); excWantVent = true; excArmSince = 0; }
+        } else if (wantMoist && canFog) {                 // too dry → arm a moisten swing after the dwell
+          if (excArmSince == 0) excArmSince = now;
+          if (now - excArmSince >= EXC_ARM_DWELL_MS) { excState = EX_MOIST; excDriveStart = now; excResetStall(vpd, now); excWantFog  = true; excArmSince = 0; }
+        } else {
+          excArmSince = 0;                                // trigger broke (transient) or gap too small → reset dwell
+          if (wantDry && canVent) ventBelowRoom = true;   // too wet but gap < arm gate → flag and wait
+        }
       }
       break;
   }
@@ -1047,7 +1064,7 @@ int fnSetControlMode(String arg) {
   if (m < 0) m = 0; if (m > 3) m = 3;
   controlMode = m;
   piState.integ = 0; piState.fogEffort = 0; piState.ventEffort = 0;   // clean handoff
-  excState = EX_REST; excRestUntil = 0; excWantVent = false; excWantFog = false;
+  excState = EX_REST; excRestUntil = 0; excArmSince = 0; excWantVent = false; excWantFog = false;
   Particle.publish("everfresh/cmd", String::format("controlMode %d", controlMode), PRIVATE);
   return controlMode;
 }

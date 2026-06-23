@@ -48,11 +48,17 @@ then rests. It's a latched 3-state machine on canopy VPD, `excursionUpdate()`:
   The dry-arm gate is stricter than `dpGap > 0`: without it, a near-equilibrium morning (room
   ≈ as moist as the tent) launches a vent that churns for the full max-drive with zero gain
   (observed 6/23). Too-wet-but-gap-too-small flags `BELOW-ROOM` and waits instead of venting.
+  **Arm dwell:** the trigger must HOLD for `EXC_ARM_DWELL_MS` (2 min) before committing — a
+  single boot/RH transient (6/23: a 1-sample RH spike to ~67% armed a vent 30 s after flash)
+  resets the dwell instead of launching a swing. Same "sustained, not instantaneous" guard as
+  the RH-relief vent and the mode-1 dry-vent.
 - **DRY** — vent runs *continuously* until VPD **overshoots** `bandHi + EXC_OVERSHOOT_KPA`
   (overdried past the far edge), then → REST. Bails to REST (flagged `BELOW-ROOM`) if the gap
-  closes, **the drive stalls** (VPD fails to rise `EXC_STALL_MIN_KPA` for `EXC_STALL_WINDOW_MS`
-  — the room-floor stop: you can't vent the canopy drier than the incoming air), or
-  `EXC_MAX_DRIVE_MS` (20 min) trips. **Circ is held at the idle mix
+  closes, **the drive stalls** (VPD fails to rise `EXC_STALL_MIN_KPA` for `EXC_STALL_WINDOW_MS`,
+  1 min — the room-floor stop: you can't vent the canopy drier than the incoming air; judged
+  every 3 s control cycle, not the 60 s log cadence), or `EXC_MAX_DRIVE_MS` (20 min) trips. The
+  stall window is *no-progress* time: any `EXC_STALL_MIN_KPA` gain re-anchors the clock, so a
+  slowly-working swing keeps running. **Circ is held at the idle mix
   floor while drying** (NOT ramped) — forced convection over the standing floor water
   re-evaporates it into the air (RH↑/VPD↓, worst at night) and fights the excursion. Unlike
   mode 2's dry-down (which ramps circ to evaporate+exhaust the reservoir), mode 3 lets the vent
@@ -117,6 +123,8 @@ New JSON fields: `cm` (mode), `cdp`/`adp` (dew points), `dpgap`, `rg` (WET/NEUTR
   tighten the room-floor stop (lower `EXC_STALL_WINDOW_MS` / raise `EXC_STALL_MIN_KPA`).
 - Dry swings fire when the room is barely drier (futile vent) → raise `EXC_DRY_ARM_GAP_F`.
 - Dry swings never fire even on a genuinely dry room → lower `EXC_DRY_ARM_GAP_F`.
+- Swings still arm on brief transients → raise `EXC_ARM_DWELL_MS`; too slow to react to a real
+  shift → lower it.
 - Arms on tiny edge noise → raise `EXC_TRIGGER_MARGIN`.
 - Vent leaves humid pockets while drying (circ too low to feed it) → raise the dry-excursion
   circ floor (`CIRC_MIX_DUTY`, or split out a dedicated knob). Default: circ idles so it doesn't
