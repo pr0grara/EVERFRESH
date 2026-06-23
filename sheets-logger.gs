@@ -24,7 +24,9 @@ var HEADERS = ['published_at', 'date_time', 'event',
                'canopyTempF', 'canopyRH', 'canopyVPD',
                'ambientTempF', 'ambientRH', 'ambientVPD',
                'heat', 'fog', 'circ', 'vent', 'mode',
-               'change', 'state', 'raw'];
+               'change', 'state', 'raw',
+               'phase', 'vtgt', 'sun',    // VPD control: diurnal phase, active VPD target, sun-detected
+               'cmode', 'canopyDP', 'ambientDP', 'dpGap', 'regime', 'ventEff', 'fogEff'];   // regime-PI: mode, dew points, gap, regime, PI efforts
 
 // Your timezone — a named zone so daylight-saving is handled automatically.
 // (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
@@ -89,7 +91,9 @@ function doPost(e) {
       pick('at'),  pick('arh'),  computeVPD(pick('at'),  pick('arh')),   // ambient
       pick('heat'), pick('fog'), pick('circ'), pick('vent'), pick('mode'),
       pick('ev'), pick('state'),
-      raw
+      raw,
+      pick('phase'), pick('vtgt'), pick('sun'),   // VPD control fields (telemetry rows only)
+      pick('cm'), pick('cdp'), pick('adp'), pick('dpgap'), pick('rg'), pick('veff'), pick('feff')
     ]);
 
     return ContentService
@@ -128,6 +132,8 @@ function testWrite() {
                    99.9, 42, computeVPD(99.9, 42),
                    72.0, 50, computeVPD(72.0, 50),
                    1, 0, 60, 100, 'test', 'manual', 'on',
-                   '{"note":"manual testWrite ok"}']);
+                   '{"note":"manual testWrite ok"}',
+                   'evening', 1.55, 1,
+                   2, 63.6, 53.2, 10.4, 'WET', 0.45, 0.0]);
   Logger.log('testWrite appended a row to sheet ' + SHEET_ID);
 }

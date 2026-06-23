@@ -123,6 +123,68 @@ const unsigned long PUBLISH_INTERVAL = 60000;
 const unsigned long OVERRIDE_DEFAULT_S = 60;
 const unsigned long OVERRIDE_MAX_S     = 600;
 
+// --- Humidity control mode (RUNTIME-selectable; the "guide back") ---
+// 0 = original RH bang-bang (RH_FOG_ON/OFF)   — most conservative fallback
+// 1 = diurnal VPD bang-bang (vpdWantFog/vpdWantDryVent)
+// 2 = moisture-regime-gated PI (dew-point gap + PI + dry-down)  — default
+// Change live with the setControlMode cloud function (no reflash). Heat is NEVER driven
+// by humidity control in any mode (the temp loop owns it). See VPD_PI_CONTROL.md.
+int controlMode = 2;
+const int MODE_RH = 0, MODE_VPD_BANGBANG = 1, MODE_REGIME_PI = 2;
+
+// Cloud-time zone (America/Los_Angeles); base offset + explicit US DST (no TZ db on device).
+const int   TZ_BASE_OFFSET = -8;          // PST hours from UTC
+const bool  TZ_USE_DST     = true;        // add +1h during the US DST window
+
+// Coarse phase boundaries (local hour, half-open [start, next))
+const int   PHASE_MORNING_START   = 6;    // [6,11)  morning
+const int   PHASE_AFTERNOON_START = 11;   // [11,16) afternoon
+const int   PHASE_EVENING_START   = 16;   // [16,20) evening (sun-gated pulse)
+const int   PHASE_NIGHT_START     = 20;   // [20,6)  night
+
+// Per-phase canopy VPD bands (kPa)
+const float VPD_NIGHT_LO = 0.75, VPD_NIGHT_HI = 0.9;   // raised: drier recovery night (mid 0.825)
+const float VPD_MORN_LO  = 0.8, VPD_MORN_HI  = 1.1;
+const float VPD_AFT_LO   = 1.0, VPD_AFT_HI   = 1.3;
+const float VPD_EVE_LO   = 1.3, VPD_EVE_HI   = 1.8;   // only when sun detected
+const float VPD_EVE_CAP  = 2.2;                       // intervene-above ceiling during the spike
+const float VPD_DEADBAND = 0.05;                      // anti-chatter on the VPD loop
+
+// Sun-detection gate for the evening pulse: sun = ambient OR canopy crosses threshold, sustained.
+const float SUN_AMB_TEMP_ON_F    = 88.0, SUN_AMB_TEMP_OFF_F    = 84.0;  // room heats hard under west sun
+const float SUN_CANOPY_TEMP_ON_F = 85.0, SUN_CANOPY_TEMP_OFF_F = 82.0;
+const float SUN_CANOPY_VPD_ON    = 1.45, SUN_CANOPY_VPD_OFF    = 1.30;
+const unsigned long SUN_DETECT_DWELL_MS = 5UL * 60 * 1000;
+
+// Active-dry vent pulse (raises VPD when chamber too humid). Gated on ambient actually being drier.
+const unsigned long VPD_DRY_DWELL_MS = 10UL * 60 * 1000;  // VPD below floor this long before drying
+const float VPD_DRY_AMBIENT_MARGIN   = 0.15;              // require ambientVPD - canopyVPD >= this (kPa)
+const unsigned long VPD_DRY_PULSE_ON_MS  =  60UL * 1000;  // ~20% duty: 1 min on...
+const unsigned long VPD_DRY_PULSE_OFF_MS = 240UL * 1000;  // ...4 min off
+
+// --- Moisture-regime-gated PI control (controlMode 2) ---
+// Regime from the inside-outside dew-point gap dpGap = canopyDP - ambientDP (°F). Dual
+// hysteresis so the regime latches without chatter.
+const float DPGAP_WET_ON_F  = 4.0, DPGAP_WET_OFF_F = 2.5;  // WET = water-loaded, venting exports moisture
+const float DPGAP_DRY_ON_F  = 1.0, DPGAP_DRY_OFF_F = 2.0;  // DRY = room ~as wet, venting futile → fog
+const float DPGAP_VENT_FULL_F = 6.0;   // vent authority = clamp(dpGap/this,0,1); fades to 0 as gap→0
+
+// PI on canopy VPD error vs band midpoint. Effort is unitless 0..1 per direction.
+const float VPD_KP = 1.20;             // effort per kPa of error
+const float VPD_KI = 0.020;            // effort per kPa per control cycle
+const float VPD_I_CLAMP = 1.50;        // |integral| hard clamp (effort units)
+const float VPD_DEADBAND_PI = 0.04;    // |error| below this → zero effort, hold integral (kPa)
+
+// On/off actuators (fog, 2-wire vent) → time-duty: effort maps to ON-fraction of this window.
+const unsigned long VPD_PI_WINDOW_MS = 300UL * 1000;   // 5-min PWM-in-time window
+const float VPD_FOG_MIN_EFFORT  = 0.10;                // below this, don't fire fog (keeps ON >= FOG_MIN_ON)
+const float VPD_VENT_MIN_EFFORT = 0.10;                // below this, don't open the vent for drying
+
+// Active dry-down pump (WET + VPD well below setpoint): circ UP with the vent to evaporate +
+// exhaust the floor reservoir so drying isn't transitory.
+const float VPD_DRYDOWN_TRIGGER_KPA = 0.15;            // VPD this far below setpoint → engage pump
+const int   CIRC_DRYDOWN_DUTY = 35;                    // moderated circ during dry-down (== assist cap)
+
 // ====================================================================
 
 // Sensor readings
@@ -159,12 +221,38 @@ double cloudCanopyT = 0, cloudCanopyRH = 0, cloudVPD = 0;
 double cloudAmbientT = 0, cloudAmbientRH = 0, cloudAmbientVPD = 0;
 int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
-char   cloudStatus[200] = "boot";
+char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
 bool stateInit=false;
+
+// Diurnal VPD-control runtime state
+enum Phase { PH_NIGHT, PH_MORNING, PH_AFTERNOON, PH_EVENING };
+Phase  curPhase = PH_AFTERNOON;        // resolved each control cycle (safe mid-range default)
+bool   sunDetected = false;            // latched evening-spike flag (hysteresis)
+unsigned long sunHighSince = 0;        // dwell clock for sun detection (0 = not high)
+float  vpdTargetLo = NAN, vpdTargetHi = NAN;   // active band (for telemetry/status)
+bool   timeValid = false;              // mirror of Time.isValid() at resolve time
+unsigned long vpdLowSince = 0;         // dwell clock while disarmed (0 = not below floor)
+unsigned long vpdDryStart = 0;         // pulse-phase anchor, set when the dry-vent arms
+bool   vpdDryVentOn = false;           // latched dry-vent request
+int    forcedPhase = -1;               // test override: -1=live clock, 0..3 = force PH_*
+bool   forcedSun = false;              // test override: force sun-detected in forced evening
+double cloudVpdTarget = 0;             // active band midpoint (Particle.variable + telemetry)
+char   cloudPhase[12] = "afternoon";   // current phase name (Particle.variable)
+
+// Moisture-regime-gated PI state (controlMode 2)
+float  canopyDP = NAN, ambientDP = NAN, dpGap = NAN;   // dew points (°F) + inside-outside gap
+bool   dpGapValid = false;             // true only when BOTH sensors valid
+enum Regime { RG_DRY, RG_NEUTRAL, RG_WET };
+Regime curRegime = RG_NEUTRAL;         // latched, hysteretic
+int    forcedRegime = -1;              // test override: -1=live, 0/1/2 = force DRY/NEUTRAL/WET
+struct PIState { float integ; float fogEffort; float ventEffort; } piState = {0, 0, 0};
+unsigned long fogPiWin = 0, ventPiWin = 0;             // time-duty window anchors
+bool   ventBelowRoom = false;          // status flag: want to dry but gap≈0 (needs heat, can't)
+double cloudCanopyDP = 0, cloudAmbientDP = 0, cloudDpGap = 0;   // telemetry mirrors
 
 // Watchdog: reset if loop() hangs >60s.
 ApplicationWatchdog *wd;
@@ -172,12 +260,22 @@ ApplicationWatchdog *wd;
 // -------------------- helpers --------------------
 
 float cToF(float c) { return c * 9.0 / 5.0 + 32.0; }
+float constrainf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 // Air Vapor Pressure Deficit (kPa) from temp (F) + RH (%), via Tetens SVP.
 float computeVPD(float tempF, float rh) {
   float tC  = (tempF - 32.0) * 5.0 / 9.0;
   float svp = 0.61078 * expf((17.27 * tC) / (tC + 237.3));
   return svp * (1.0 - rh / 100.0);
+}
+
+// Dew point (°F) from temp (F) + RH (%), Magnus (a=17.62, b=243.12°C).
+float computeDewPoint(float tempF, float rh) {
+  float tC = (tempF - 32.0) * 5.0 / 9.0;
+  if (rh < 1.0) rh = 1.0;                       // guard ln(0)
+  float a = 17.62, b = 243.12;
+  float g = logf(rh / 100.0) + (a * tC) / (b + tC);
+  return cToF((b * g) / (a - g));
 }
 
 void writeRelay(int pin, bool on) {
@@ -349,6 +447,15 @@ void readSensors() {
   cloudAmbientT  = ambient.ok ? ambient.tempF : -1;
   cloudAmbientRH = ambient.ok ? ambient.rh    : -1;
   cloudAmbientVPD= ambient.ok ? computeVPD(ambient.tempF, ambient.rh) : -1;
+
+  // Moisture-load sense organ: inside-outside dew-point gap (needs BOTH sensors).
+  canopyDP  = canopy.ok  ? computeDewPoint(canopy.tempF, canopy.rh)   : NAN;
+  ambientDP = ambient.ok ? computeDewPoint(ambient.tempF, ambient.rh) : NAN;
+  dpGapValid = canopy.ok && ambient.ok;
+  dpGap = dpGapValid ? (canopyDP - ambientDP) : NAN;
+  cloudCanopyDP  = canopy.ok  ? canopyDP  : -100;
+  cloudAmbientDP = ambient.ok ? ambientDP : -100;
+  cloudDpGap     = dpGapValid ? dpGap     : -100;
 }
 
 // -------------------- control --------------------
@@ -363,14 +470,225 @@ bool applyHysteresis(bool current, bool wantOn, unsigned long &lastChange,
   return wantOn;
 }
 
+// -------------------- diurnal VPD control --------------------
+
+const char* phaseName(Phase p) {
+  switch (p) {
+    case PH_NIGHT:     return "night";
+    case PH_MORNING:   return "morning";
+    case PH_AFTERNOON: return "afternoon";
+    default:           return "evening";
+  }
+}
+
+// US DST window: 2nd Sunday of March 02:00 .. 1st Sunday of November 02:00. Pure date math
+// (device has no TZ database). Ignores the 02:00 cutover hour on the two transition days —
+// a ≤1h phase-boundary slip then, which is cosmetic.
+bool usDstActive() {
+  int m = Time.month(), d = Time.day(), wd = Time.weekday();  // weekday: 1=Sun..7=Sat
+  if (m < 3 || m > 11) return false;
+  if (m > 3 && m < 11) return true;
+  int prevSunday = d - (wd - 1);          // date of the most recent Sunday (<1 => prior month)
+  if (m == 3)  return prevSunday >= 8;     // March: on/after the 2nd Sunday
+  return prevSunday < 1;                    // November: before the 1st Sunday
+}
+
+// Latch the evening spike: sun = ambient OR canopy crossing threshold, sustained, with
+// on/off hysteresis (passing clouds don't toggle it). Mirrors the rhHighSince dwell idiom.
+void resolveSun() {
+  if (forcedPhase >= 0) { sunDetected = forcedSun; sunHighSince = 0; return; }
+  if (curPhase != PH_EVENING || !sensorsValid) { sunDetected = false; sunHighSince = 0; return; }
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  bool hot = (ambient.ok && ambient.tempF >= SUN_AMB_TEMP_ON_F)
+             || ctrlTempF >= SUN_CANOPY_TEMP_ON_F
+             || vpd >= SUN_CANOPY_VPD_ON;
+  bool ambCool = !ambient.ok || ambient.tempF <= SUN_AMB_TEMP_OFF_F;
+  bool cool = ambCool && ctrlTempF <= SUN_CANOPY_TEMP_OFF_F && vpd <= SUN_CANOPY_VPD_OFF;
+  unsigned long now = millis();
+  if (hot) {
+    if (sunHighSince == 0) sunHighSince = now;
+    if (now - sunHighSince >= SUN_DETECT_DWELL_MS) sunDetected = true;
+  } else {
+    sunHighSince = 0;                        // not currently hot → restart the dwell
+    if (sunDetected && cool) sunDetected = false;   // clear the latch only when clearly cool
+  }
+}
+
+// Set the active VPD band from the phase (+ evening sun gate) and publish its midpoint.
+void resolveBand() {
+  switch (curPhase) {
+    case PH_NIGHT:     vpdTargetLo = VPD_NIGHT_LO; vpdTargetHi = VPD_NIGHT_HI; break;
+    case PH_MORNING:   vpdTargetLo = VPD_MORN_LO;  vpdTargetHi = VPD_MORN_HI;  break;
+    case PH_AFTERNOON: vpdTargetLo = VPD_AFT_LO;   vpdTargetHi = VPD_AFT_HI;   break;
+    case PH_EVENING:
+      if (sunDetected) { vpdTargetLo = VPD_EVE_LO; vpdTargetHi = VPD_EVE_HI; }  // ride the spike
+      else             { vpdTargetLo = VPD_AFT_LO; vpdTargetHi = VPD_AFT_HI; }  // overcast = rest day
+      break;
+  }
+  cloudVpdTarget = (vpdTargetLo + vpdTargetHi) / 2.0;
+  strncpy(cloudPhase, phaseName(curPhase), sizeof(cloudPhase) - 1);
+  cloudPhase[sizeof(cloudPhase) - 1] = '\0';
+}
+
+// Resolve clock phase (test-force > unsynced-fallback > wall clock), then sun + band.
+void resolvePhase() {
+  timeValid = Time.isValid();
+  if (forcedPhase >= 0) {
+    curPhase = (Phase)forcedPhase;
+  } else if (!timeValid) {
+    curPhase = PH_AFTERNOON;                 // before cloud time syncs — never block control
+  } else {
+    int h = Time.hour();                      // base-offset local (Time.zone set in setup)
+    if (TZ_USE_DST && usDstActive()) h = (h + 1) % 24;
+    if      (h >= PHASE_NIGHT_START || h < PHASE_MORNING_START) curPhase = PH_NIGHT;
+    else if (h <  PHASE_AFTERNOON_START)                        curPhase = PH_MORNING;
+    else if (h <  PHASE_EVENING_START)                          curPhase = PH_AFTERNOON;
+    else                                                        curPhase = PH_EVENING;
+  }
+  resolveSun();
+  resolveBand();
+}
+
+// ---- moisture-regime-gated PI (controlMode 2) ----
+const char* regimeName(Regime r) { return r == RG_WET ? "WET" : (r == RG_DRY ? "DRY" : "NEUTRAL"); }
+
+// Classify the moisture regime from the inside-outside dew-point gap, dual hysteresis.
+// WET = chamber water-loaded (venting exports moisture, fog unsafe); DRY = room ~as wet
+// (venting futile, fog is the safe lever); NEUTRAL between. No gap / forced → safe handling.
+void resolveRegime() {
+  if (forcedRegime >= 0) { curRegime = (Regime)forcedRegime; return; }
+  if (!dpGapValid)       { curRegime = RG_NEUTRAL; return; }
+  switch (curRegime) {
+    case RG_WET:
+      if (dpGap < DPGAP_WET_OFF_F) curRegime = (dpGap <= DPGAP_DRY_ON_F) ? RG_DRY : RG_NEUTRAL;
+      break;
+    case RG_DRY:
+      if (dpGap > DPGAP_DRY_OFF_F) curRegime = (dpGap >= DPGAP_WET_ON_F) ? RG_WET : RG_NEUTRAL;
+      break;
+    default: // RG_NEUTRAL
+      if      (dpGap >= DPGAP_WET_ON_F) curRegime = RG_WET;
+      else if (dpGap <= DPGAP_DRY_ON_F) curRegime = RG_DRY;
+      break;
+  }
+}
+
+// PI on canopy VPD error vs the band midpoint. Output splits by sign into one-directional
+// fog/vent efforts (0..1), each gated by the regime interlock + feasibility. Heat untouched.
+// Anti-windup: clamp + conditional integration + bleed when the active lever is suppressed.
+// Vent authority fades as dpGap→0 (can't dry below room dew point — that needs heat).
+void vpdPIUpdate() {
+  ventBelowRoom = false;
+  if (!sensorsValid) { piState.integ = 0; piState.fogEffort = 0; piState.ventEffort = 0; return; }
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  if (vpd < 0) { piState.fogEffort = 0; piState.ventEffort = 0; return; }
+  float sp = (vpdTargetLo + vpdTargetHi) / 2.0;     // band midpoint setpoint
+  float e  = sp - vpd;                              // +e too humid (vent), -e too dry (fog)
+
+  if (fabsf(e) < VPD_DEADBAND_PI) { piState.fogEffort = 0; piState.ventEffort = 0; return; }  // hold integral
+
+  bool  wantVent = (e > 0);                         // too humid → dry by venting
+  bool  wantFog  = (e < 0);                         // too dry  → fog
+  float ventAuth = dpGapValid ? constrainf(dpGap / DPGAP_VENT_FULL_F, 0.0, 1.0) : 0.0;
+  bool  ventFeasible = wantVent && (curRegime != RG_DRY) && (ventAuth > 0.0);
+  bool  fogFeasible  = wantFog  && (curRegime != RG_WET) && (ctrlRH < RH_CEILING);
+  if (wantVent && ventAuth <= 0.0) ventBelowRoom = true;   // want to dry but gap≈0 → needs heat
+
+  float p = VPD_KP * e;
+  float iTrial = piState.integ + VPD_KI * e;
+  bool  activeFeasible = (wantVent && ventFeasible) || (wantFog && fogFeasible);
+  if (!activeFeasible) {
+    piState.integ *= 0.90;                          // bleed stale demand when suppressed/infeasible
+  } else {
+    float outTrial = p + iTrial;
+    bool sat = fabsf(outTrial) >= 1.0;
+    if (!(sat && ((outTrial > 0) == (e > 0))))      // conditional integration: not further into sat
+      piState.integ = constrainf(iTrial, -VPD_I_CLAMP, VPD_I_CLAMP);
+  }
+
+  float out = constrainf(p + piState.integ, -1.0, 1.0);
+  piState.ventEffort = ventFeasible ? constrainf(out,  0.0, 1.0) * ventAuth : 0.0;
+  piState.fogEffort  = fogFeasible  ? constrainf(-out, 0.0, 1.0)            : 0.0;
+}
+
+// Map effort (0..1) to an ON window-fraction over VPD_PI_WINDOW_MS (anchored, not per-cycle).
+bool piPulseOn(float effort, float minEffort, unsigned long &winStart, unsigned long now) {
+  if (effort < minEffort) return false;
+  if (winStart == 0 || now - winStart >= VPD_PI_WINDOW_MS) winStart = now;
+  unsigned long onMs = (unsigned long)(effort * (float)VPD_PI_WINDOW_MS);
+  return (now - winStart) < onMs;
+}
+
+// WET regime + VPD well below setpoint → run circ UP (with the vent) to evaporate+exhaust the
+// floor reservoir so drying isn't transitory. Bounded by the desiccation cap; mold floor sacred.
+bool vpdWantDryDown() {
+  if (controlMode != MODE_REGIME_PI || !sensorsValid || curRegime != RG_WET) return false;
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  if (vpd < 0) return false;
+  float sp = (vpdTargetLo + vpdTargetHi) / 2.0;
+  return (sp - vpd) >= VPD_DRYDOWN_TRIGGER_KPA;
+}
+
+// Desired fog state from the active canopy VPD band. Fog LOWERS VPD; heat is never touched
+// here (the temp loop owns it). Center-restoring hysteresis: fire when VPD leaves the band
+// on the dry side (above band-hi, or above the cap during a detected evening spike), then
+// fog until VPD is pulled back to the band MIDPOINT (not just the edge) so it doesn't drift
+// straight back out and chatter.
+bool vpdWantFog(bool fogCurrent) {
+  if (!sensorsValid) return fogCurrent;
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  if (vpd < 0) return fogCurrent;
+  bool spike = (curPhase == PH_EVENING && sunDetected);
+  float mid  = (vpdTargetLo + vpdTargetHi) / 2.0;
+  float onAt = spike ? VPD_EVE_CAP : vpdTargetHi;               // fire when VPD leaves the band
+  if (!fogCurrent && vpd > onAt + VPD_DEADBAND) return true;    // too dry → fog
+  if ( fogCurrent && vpd <= mid)               return false;    // pulled back to centre → stop
+  return fogCurrent;                                            // in band → hold
+}
+
+// Active-dry vent: pulse the vent to RAISE VPD when the chamber has sat too humid, but only
+// when venting would actually dry (ambient air drier in deficit terms). Pulsed (~20% duty)
+// so it nudges without crashing temp / over-drying. Returns true when the pulse is ON.
+bool vpdWantDryVent(unsigned long now) {
+  if (controlMode != MODE_VPD_BANGBANG || !sensorsValid) { vpdLowSince = 0; vpdDryVentOn = false; return false; }
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  if (vpd < 0) { vpdLowSince = 0; vpdDryVentOn = false; return false; }
+  float mid = (vpdTargetLo + vpdTargetHi) / 2.0;          // aim for band centre, not the floor
+  bool ambientDrier = ambient.ok && (cloudAmbientVPD - vpd) >= VPD_DRY_AMBIENT_MARGIN;
+  unsigned long period = VPD_DRY_PULSE_ON_MS + VPD_DRY_PULSE_OFF_MS;
+
+  if (!ambientDrier) {
+    vpdLowSince = 0; vpdDryVentOn = false;               // venting can't dry → stand down
+  } else if (!vpdDryVentOn) {
+    // Arm after a sustained spell BELOW the floor. Reset the dwell only on a clear recovery
+    // back to the floor (not on tiny noise), so VPD hovering just under the floor still arms.
+    if (vpd < vpdTargetLo) {
+      if (vpdLowSince == 0) vpdLowSince = now;
+      if (now - vpdLowSince >= VPD_DRY_DWELL_MS) { vpdDryVentOn = true; vpdDryStart = now; }
+    } else {
+      vpdLowSince = 0;
+    }
+  } else {
+    // Armed. Judge success ONLY on a SETTLED reading — late in an OFF window, vent not running —
+    // so the vent+circ inrush during a pulse can't spike the canopy past the target and self-disarm.
+    unsigned long ph = (now - vpdDryStart) % period;
+    bool settled = ph >= (VPD_DRY_PULSE_ON_MS + VPD_DRY_PULSE_OFF_MS / 2);
+    if (settled && vpd >= mid) { vpdDryVentOn = false; vpdLowSince = 0; }
+  }
+
+  if (!vpdDryVentOn) return false;
+  return ((now - vpdDryStart) % period) < VPD_DRY_PULSE_ON_MS;   // full 1-min ON each cycle
+}
+
 // Circulation fan speed, three regimes:
 //   1. Active cooling/mist (fog or vent) → full, to disperse mist / feed the vent.
 //   2. RH-assist — RH sagging toward the fog-on point → ramp from the idle mix speed
 //      up to CIRC_RH_ASSIST_MAX, evaporating more floor water to prop RH up before the
 //      fogger fires (flatten the decay; fewer, shallower sawteeth).
 //   3. Idle → continuous gentle mixing (homogenize + slowly dry the floor).
-int circAutoDuty(bool fogActive, bool ventActive) {
-  if (fogActive || ventActive) return CIRC_FOG_DUTY;     // (1) cooling / mist dispersion
+int circAutoDuty(bool fogActive, bool ventActive, bool dryDown) {
+  if (fogActive)               return CIRC_FOG_DUTY;     // (1) mist dispersion needs full
+  if (dryDown)                 return CIRC_DRYDOWN_DUTY; // dry-down: moderated evaporate+exhaust (not 100% → desiccation)
+  if (ventActive)              return CIRC_FOG_DUTY;     // genuine cooling vent → feed it full
   if (!sensorsValid)           return CIRC_MIX_DUTY;     // no RH reading → gentle idle
   // (2) RH-assist ramp across [RH_FOG_ON, RH_FOG_ON + RH_ASSIST_BAND].
   float top = RH_FOG_ON + RH_ASSIST_BAND;
@@ -424,11 +742,20 @@ int ventAutoDuty(unsigned long now) {
     tempVentOn = false; rhVentOn = false; rhHighSince = 0;
   }
 
-  return (exchangeWindow || coolPulseOn || rhVentOn) ? VENT_DUTY : 0;
+  // Humidity dry-vent: mode 2 = regime-gated PI effort (time-duty); mode 1 = legacy pulse;
+  // mode 0 = none. (piState efforts are refreshed in control() before this runs.)
+  bool dryVentOn = false;
+  if      (controlMode == MODE_REGIME_PI)    dryVentOn = piPulseOn(piState.ventEffort, VPD_VENT_MIN_EFFORT, ventPiWin, now);
+  else if (controlMode == MODE_VPD_BANGBANG) dryVentOn = vpdWantDryVent(now);
+
+  return (exchangeWindow || coolPulseOn || rhVentOn || dryVentOn) ? VENT_DUTY : 0;
 }
 
 void control() {
   unsigned long now = millis();
+  resolvePhase();   // updates curPhase / sunDetected / vpdTargetLo,Hi for the VPD layer
+  resolveRegime();  // moisture regime from the dew-point gap (drives the mode-2 interlock)
+  if (controlMode == MODE_REGIME_PI) vpdPIUpdate();   // refresh PI fog + dry-vent efforts
   bool overheat = sensorsValid && (ctrlTempF >= TEMP_SAFETY_F);
 
   // ===== 1) AUTOMATIC heat/fog decisions (hysteresis) =====
@@ -439,18 +766,32 @@ void control() {
     else if (heatOn  && ctrlTempF > HEAT_OFF_F) autoHeat = false;
     else                                        autoHeat = heatOn;
 
-    bool wantHumidity;
-    if (!fogOn && ctrlRH < RH_FOG_ON)       wantHumidity = true;
-    else if (fogOn && ctrlRH > RH_FOG_OFF)  wantHumidity = false;
-    else                                    wantHumidity = fogOn;
+    if (controlMode == MODE_REGIME_PI) {
+      // PI fog effort → time-duty. Regime interlock already zeroed fogEffort in WET. Temp-
+      // cooling demand still overrides upward; RH ceiling stays a hard wet backstop.
+      autoFog = piPulseOn(piState.fogEffort, VPD_FOG_MIN_EFFORT, fogPiWin, now);
+      if (ctrlTempF > COOL_ON_F) autoFog = true;
+      if (ctrlRH >= RH_CEILING)  autoFog = false;
+    } else if (controlMode == MODE_VPD_BANGBANG) {
+      // Diurnal VPD bang-bang (center-restoring).
+      autoFog = vpdWantFog(fogOn);
+      if (ctrlTempF > COOL_ON_F) autoFog = true;
+      if (ctrlRH >= RH_CEILING)  autoFog = false;
+    } else {
+      // mode 0: original RH/temp bang-bang.
+      bool wantHumidity;
+      if (!fogOn && ctrlRH < RH_FOG_ON)       wantHumidity = true;
+      else if (fogOn && ctrlRH > RH_FOG_OFF)  wantHumidity = false;
+      else                                    wantHumidity = fogOn;
 
-    bool wantCooling;
-    if (ctrlTempF > COOL_ON_F)       wantCooling = true;
-    else if (ctrlTempF < COOL_OFF_F) wantCooling = false;
-    else                             wantCooling = fogOn;
+      bool wantCooling;
+      if (ctrlTempF > COOL_ON_F)       wantCooling = true;
+      else if (ctrlTempF < COOL_OFF_F) wantCooling = false;
+      else                             wantCooling = fogOn;
 
-    autoFog = (wantHumidity || wantCooling);
-    if (ctrlRH >= RH_CEILING) autoFog = false;
+      autoFog = (wantHumidity || wantCooling);
+      if (ctrlRH >= RH_CEILING) autoFog = false;
+    }
   }
 
   // ===== 2) MANUAL OVERRIDE layer =====
@@ -477,7 +818,7 @@ void control() {
 
   // ===== 5) fans — vent first (primary heat removal), then circ moves air to it =====
   int ventReq = ventManual ? ventOverrideDuty : ventAutoDuty(now);
-  int circReq = circManual ? circOverrideDuty : circAutoDuty(fogOn, ventReq > 0);
+  int circReq = circManual ? circOverrideDuty : circAutoDuty(fogOn, ventReq > 0, vpdWantDryDown());
 
   // ===== 5b) EMERGENCY BACKSTOP — only at a true runaway temp =====
   // Normal high-temp cooling is the vent hysteresis (VENT_TEMP_ON_F) + fog. This forces
@@ -500,11 +841,14 @@ void control() {
       heatOn ? "ON":"off", fogOn ? "ON":"off", circReq, ventReq, cloudMode);
   } else {
     snprintf(cloudStatus, sizeof(cloudStatus),
-      "T=%.1fF RH=%.0f%% VPD=%.2f | heat=%s fog=%s circ=%d%% vent=%d%% [%s]%s%s",
+      "T=%.1fF RH=%.0f%% VPD=%.2f | heat=%s fog=%s circ=%d%% vent=%d%% [%s] m%d %s gap=%.1f %s→%.2f%s%s%s%s",
       ctrlTempF, ctrlRH, cloudVPD,
       heatOn ? "ON":"off", fogOn ? "ON":"off", circReq, ventReq, cloudMode,
+      controlMode, regimeName(curRegime), cloudDpGap,
+      phaseName(curPhase), cloudVpdTarget, sunDetected ? "(sun)" : "",
       overheat ? " OVERHEAT" : "",
-      (ctrlRH >= RH_CEILING) ? " RH-ceiling" : "");
+      (ctrlRH >= RH_CEILING) ? " RH-ceiling" : "",
+      ventBelowRoom ? " BELOW-ROOM" : "");
   }
 }
 
@@ -570,18 +914,58 @@ int fnClearOverrides(String arg) {
   Particle.publish("everfresh/cmd", "cleared", PRIVATE);
   return 0;
 }
+// setPhase("-1") => live clock; setPhase("0".."3") => force PH_NIGHT/MORNING/AFTERNOON/EVENING;
+// setPhase("3,sun") => force evening WITH sun detected (test the hardening pulse on the bench).
+int fnSetPhase(String arg) {
+  arg.trim();
+  int comma = arg.indexOf(',');
+  String p = (comma >= 0 ? arg.substring(0, comma) : arg); p.trim();
+  int n = (p.length() ? p.toInt() : -1);
+  if (n < -1) n = -1; if (n > 3) n = 3;
+  forcedPhase = n;
+  String s = (comma >= 0 ? arg.substring(comma + 1) : ""); s.trim();
+  forcedSun = (s == "1" || s.equalsIgnoreCase("sun"));
+  Particle.publish("everfresh/cmd", String::format("phase %d sun=%d", forcedPhase, forcedSun ? 1 : 0), PRIVATE);
+  return forcedPhase;
+}
+// setControlMode("0|1|2") -> 0 RH bang-bang, 1 VPD bang-bang, 2 regime-PI. The "guide back":
+// flip to 1 or 0 live (no reflash) if the regime-PI layer misbehaves. See VPD_PI_CONTROL.md.
+int fnSetControlMode(String arg) {
+  arg.trim();
+  int m = arg.toInt();
+  if (m < 0) m = 0; if (m > 2) m = 2;
+  controlMode = m;
+  piState.integ = 0; piState.fogEffort = 0; piState.ventEffort = 0;   // clean handoff
+  Particle.publish("everfresh/cmd", String::format("controlMode %d", controlMode), PRIVATE);
+  return controlMode;
+}
+// setRegime("-1") => live (dew-point gap); "0|1|2" => force DRY/NEUTRAL/WET for bench testing
+// without spoofing the ambient sensor.
+int fnSetRegime(String arg) {
+  arg.trim();
+  int r = (arg.length() ? arg.toInt() : -1);
+  if (r < -1) r = -1; if (r > 2) r = 2;
+  forcedRegime = r;
+  Particle.publish("everfresh/cmd", String::format("regime %d", forcedRegime), PRIVATE);
+  return forcedRegime;
+}
 
 // -------------------- telemetry --------------------
 
 void publishTelemetry() {
-  char json[255];
+  char json[440];
   snprintf(json, sizeof(json),
     "{\"ct\":%.1f,\"crh\":%.0f,\"vpd\":%.2f,"
     "\"at\":%.1f,\"arh\":%.0f,\"avpd\":%.2f,"
-    "\"heat\":%d,\"fog\":%d,\"circ\":%d,\"vent\":%d,\"mode\":\"%s\"}",
+    "\"heat\":%d,\"fog\":%d,\"circ\":%d,\"vent\":%d,\"mode\":\"%s\","
+    "\"phase\":\"%s\",\"vtgt\":%.2f,\"sun\":%d,"
+    "\"cm\":%d,\"cdp\":%.1f,\"adp\":%.1f,\"dpgap\":%.1f,\"rg\":\"%s\",\"veff\":%.2f,\"feff\":%.2f}",
     cloudCanopyT, cloudCanopyRH, cloudVPD,
     cloudAmbientT, cloudAmbientRH, cloudAmbientVPD,
-    cloudHeat, cloudFog, circDuty, ventDuty, cloudMode);
+    cloudHeat, cloudFog, circDuty, ventDuty, cloudMode,
+    phaseName(curPhase), cloudVpdTarget, sunDetected ? 1 : 0,
+    controlMode, cloudCanopyDP, cloudAmbientDP, cloudDpGap, regimeName(curRegime),
+    piState.ventEffort, piState.fogEffort);
   Particle.publish("everfresh/telemetry", json, PRIVATE);
 }
 
@@ -634,6 +1018,8 @@ void setup() {
   Wire.begin();   // canopy SHT31 on the hardware bus
   swI2CInit();    // ambient SHT31 on its dedicated software bus (D5/D6)
 
+  Time.zone(TZ_BASE_OFFSET);   // base local offset; DST added per-cycle in resolvePhase()
+
   Particle.variable("canopyTempF",  cloudCanopyT);
   Particle.variable("canopyRH",     cloudCanopyRH);
   Particle.variable("vpd",          cloudVPD);
@@ -646,12 +1032,19 @@ void setup() {
   Particle.variable("fog",          cloudFog);
   Particle.variable("mode",         cloudMode);
   Particle.variable("status",       cloudStatus);
+  Particle.variable("phase",        cloudPhase);
+  Particle.variable("vpdTarget",    cloudVpdTarget);
+  Particle.variable("controlMode",  controlMode);
+  Particle.variable("dpGap",        cloudDpGap);
 
   Particle.function("setFog",         fnSetFog);         // arg: "1"/"0" [,seconds]
   Particle.function("setHeat",        fnSetHeat);        // arg: "1"/"0" [,seconds]
   Particle.function("setCirc",        fnSetCirc);        // arg: "duty" [,seconds]
   Particle.function("setVent",        fnSetVent);        // arg: "duty" [,seconds]
   Particle.function("clearOverrides", fnClearOverrides); // arg: (ignored)
+  Particle.function("setPhase",       fnSetPhase);       // arg: "-1" live | "0..3" | "3,sun"
+  Particle.function("setControlMode", fnSetControlMode); // arg: "0" RH | "1" VPD | "2" regime-PI
+  Particle.function("setRegime",      fnSetRegime);      // arg: "-1" live | "0..2" force DRY/NEUT/WET
 
   wd = new ApplicationWatchdog(60000, System.reset, 1536);
 
