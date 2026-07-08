@@ -43,6 +43,8 @@ MAX_BACKFILL_DAYS = 30   # safety cap on how far back a single run will fill
 COL_TEMP = "#4285F4"   # blue   (left axis)
 COL_RH   = "#EA4335"   # red    (left axis)
 COL_VPD  = "#FBBC04"   # yellow (right axis)
+COL_DP   = "#34A853"   # green  (left axis — dew points, °F; gap between the two = dpGap)
+COL_GAP  = "#9334E6"   # purple (3rd axis — dpGap °F, the floor-evaporation tachometer)
 # ===============================================================
 
 CSV_URL = (f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
@@ -69,14 +71,25 @@ def _get(row, *names):
     return ""
 
 
+def _num(row, *names):
+    """Float of the first present candidate column, or NaN if none parse."""
+    try:
+        return float(_get(row, *names))
+    except ValueError:
+        return float("nan")
+
+
 def parse_points(rows):
-    """Keep telemetry rows (numeric temp + RH); return [(dt, temp, rh, vpd), ...].
+    """Keep telemetry rows (numeric canopy temp + RH); return one tuple per row:
+    (dt, temp, rh, vpd, atemp, arh, avpd, cdp, adp, dpgap) — canopy first, then
+    ambient (the room sensor added later; NaN on older rows that predate it), then
+    the dew points and inside-outside dew-point gap (dpGap = canopyDP - ambientDP).
     Column names are matched leniently so this works against both the current
     sheets-logger.gs schema (vpd_kpa) and the older deployed sheet (VPD)."""
     pts = []
     for row in rows:
-        # Canopy is the control point we chart. Names listed newest-first so this
-        # works across the rename (canopy* now, bare tempF/rh/VPD on older rows).
+        # Canopy is the control point. Names listed newest-first so this works
+        # across the rename (canopy* now, bare tempF/rh/VPD on older rows).
         t = _get(row, "canopyTempF", "tempF")
         h = _get(row, "canopyRH", "rh")
         if not t or not h:
@@ -85,15 +98,21 @@ def parse_points(rows):
             tempF, rh = float(t), float(h)
         except ValueError:
             continue
-        try:
-            vpd = float(_get(row, "canopyVPD", "VPD", "vpd_kpa", "vpd"))
-        except ValueError:
-            vpd = float("nan")
+        vpd = _num(row, "canopyVPD", "VPD", "vpd_kpa", "vpd")
         try:
             dt = datetime.fromisoformat(_get(row, "published_at").replace("Z", "+00:00")).astimezone(TZ)
         except ValueError:
             continue
-        pts.append((dt, tempF, rh, vpd))
+        # Ambient (room) sensor — NaN before it was installed; matplotlib gaps NaNs.
+        atemp = _num(row, "ambientTempF", "atempF", "at")
+        arh   = _num(row, "ambientRH", "arh")
+        avpd  = _num(row, "ambientVPD", "avpd_kpa", "avpd")
+        # Dew points (°F) and the gap that drives the regime / vent authority. Same
+        # NaN-on-old-rows behavior; dpGap is the floor-water evaporation tachometer.
+        cdp   = _num(row, "canopyDP")
+        adp   = _num(row, "ambientDP")
+        dpgap = _num(row, "dpGap")
+        pts.append((dt, tempF, rh, vpd, atemp, arh, avpd, cdp, adp, dpgap))
     pts.sort(key=lambda p: p[0])
     return pts
 
@@ -109,26 +128,55 @@ def plot_window(pts, label, hours, out_dir, anchor):
     times = [p[0] for p in w]
 
     fig, ax = plt.subplots(figsize=(12, 4.5))
-    ax.plot(times, [p[1] for p in w], color=COL_TEMP, linewidth=1.5, label="Temp °F")
-    ax.plot(times, [p[2] for p in w], color=COL_RH,   linewidth=1.5, label="RH %")
+    # Canopy = solid (the control point); ambient/room = dashed, same colors so each
+    # metric pairs visually. Ambient lines gap automatically where the value is NaN
+    # (rows logged before the room sensor was installed).
+    ax.plot(times, [p[1] for p in w], color=COL_TEMP, linewidth=1.5, label="Canopy T °F")
+    ax.plot(times, [p[2] for p in w], color=COL_RH,   linewidth=1.5, label="Canopy RH %")
+    ax.plot(times, [p[4] for p in w], color=COL_TEMP, linewidth=1.2, linestyle="--",
+            alpha=0.7, label="Ambient T °F")
+    ax.plot(times, [p[5] for p in w], color=COL_RH,   linewidth=1.2, linestyle="--",
+            alpha=0.7, label="Ambient RH %")
+    # Dew points (°F) live on the same left axis as temp — the vertical distance
+    # between the two green lines IS dpGap (canopyDP above ambientDP when canopy is
+    # wetter / the floor reservoir is evaporating).
+    ax.plot(times, [p[7] for p in w], color=COL_DP, linewidth=1.3, label="Canopy DP °F")
+    ax.plot(times, [p[8] for p in w], color=COL_DP, linewidth=1.1, linestyle="--",
+            alpha=0.7, label="Ambient DP °F")
     ax.set_ylim(40, 100)
     ax.set_ylabel("°F  /  %RH")
 
     ax2 = ax.twinx()
-    ax2.plot(times, [p[3] for p in w], color=COL_VPD, linewidth=1.5, label="VPD kPa")
+    ax2.plot(times, [p[3] for p in w], color=COL_VPD, linewidth=1.5, label="Canopy VPD kPa")
+    ax2.plot(times, [p[6] for p in w], color=COL_VPD, linewidth=1.2, linestyle="--",
+             alpha=0.7, label="Ambient VPD kPa")
     ax2.set_ylim(0, 2.5)
     ax2.set_ylabel("VPD kPa")
+
+    # Third axis (offset to the right): dpGap itself, the floor-evaporation
+    # tachometer. Fixed scale so the magnitude is comparable across snapshots; the
+    # faint line at 0 is the regime flip (wet above / dry below).
+    ax3 = ax.twinx()
+    ax3.spines["right"].set_position(("axes", 1.07))
+    ax3.plot(times, [p[9] for p in w], color=COL_GAP, linewidth=1.6, label="dpGap °F")
+    ax3.axhline(0, color=COL_GAP, linewidth=0.7, alpha=0.25)
+    ax3.set_ylim(-2, 14)
+    ax3.set_ylabel("dpGap °F", color=COL_GAP)
+    ax3.tick_params(axis="y", colors=COL_GAP)
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I:%M %p", tz=TZ))
     fig.autofmt_xdate()
     ax.set_title(f"EVERFRESH — last {label}   (as of {anchor.strftime('%-m/%d %-I:%M %p')})")
     ax.grid(True, alpha=0.3)
 
-    # Combined legend across both axes.
-    lines = ax.get_lines() + ax2.get_lines()
-    ax.legend(lines, [l.get_label() for l in lines], loc="upper center", ncol=3, frameon=False)
+    # Combined legend across all three axes.
+    lines = ax.get_lines() + ax2.get_lines() + ax3.get_lines()
+    ax.legend(lines, [l.get_label() for l in lines], loc="upper center", ncol=3,
+              frameon=False, fontsize=8)
 
-    fig.tight_layout()
+    # Explicit margins instead of tight_layout: the offset 3rd-axis spine isn't
+    # tight_layout-compatible (warns + can clip). Leave room on the right for it.
+    fig.subplots_adjust(left=0.06, right=0.89, top=0.88, bottom=0.18)
     path = out_dir / f"{label}.png"
     fig.savefig(path, dpi=130)
     plt.close(fig)
