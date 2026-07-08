@@ -10,14 +10,16 @@
  * Actuators:
  *   HEAT  — 120VAC heater via SSR                    (on/off, D2)
  *   FOG   — 24VDC ultrasonic fogger transducer/MOSFET (on/off, D3)
- *   CIRC  — 4-pin PWM circulation fan (A5): INTERNAL mixing, no fresh air.
+ *   CIRC  — 4-pin PWM circulation fan (PWM A5 + power MOSFET D4): INTERNAL mixing.
  *           Runs full during every fog cycle + continuous gentle mixing between cycles.
- *   VENT  — 2-wire exchange fan (A4): fresh-air exchange with ambient. On-demand:
- *           cooling + high-RH safety. Periodic exchange disabled (leaky chamber) —
- *           re-enable VENT_SCHEDULE_ENABLED once the chamber is sealed.
+ *   VENT  — 4-pin PWM exchange fan (PWM WKP + power MOSFET A4): fresh-air exchange
+ *           with ambient. On-demand: cooling + high-RH safety. Periodic exchange
+ *           disabled (leaky chamber) — re-enable VENT_SCHEDULE_ENABLED once sealed.
  *
- * 4-pin fans: PWM wire driven directly from the Photon (no MOSFET); 12V + GND
- * constant; tach unused. The fogger transducer (24V) keeps its MOSFET; heater its SSR.
+ * 4-pin fans: speed via 25kHz PWM on the control wire, power gated by a low-side
+ * MOSFET for a true hard-off (the PWM wire is released to Hi-Z when off so the fan
+ * can't back-feed to ground and idle at min); 12V + GND otherwise constant; tach
+ * unused. The fogger transducer (24V) keeps its MOSFET; heater its SSR.
  *
  * Control: hysteresis bang-bang for heat and fog (RH is the humidity loop). Fans run
  * on schedules + thresholds. VPD is computed/logged for future VPD-based control.
@@ -38,8 +40,9 @@ const int PIN_HEAT     = D2;   // heater SSR (on/off)
 const int PIN_FOG      = D3;   // fogger transducer MOSFET (on/off, 24V)
 const int PIN_CIRC_PWM = A5;   // circ fan (4-wire) PWM control wire — speed
 const int PIN_CIRC_PWR = D4;   // circ fan power MOSFET — true on/off
-const int PIN_VENT     = A4;   // vent fan (2-wire) MOSFET — on/off
-const int FAN_PWM_FREQ = 25000;   // 25kHz PWM into the circ fan's control wire
+const int PIN_VENT_PWM = WKP;  // (A7) vent fan (4-wire) PWM control wire — speed (25kHz)
+const int PIN_VENT_PWR = A4;   // vent fan power MOSFET — true on/off (hard off)
+const int FAN_PWM_FREQ = 25000;   // 25kHz PWM into both 4-wire fans' control wires
 
 // Ambient sensor's dedicated software-I2C bus (see sensor section). Both pins need
 // a pull-up (4.7k–10k) to 3.3V; most SHT31 breakouts include them onboard.
@@ -78,6 +81,14 @@ const int CIRC_MIX_DUTY = 1;    // % continuous mix speed (lower if floor over-d
 // interval. Kept gentle so sustained airflow doesn't desiccate the foliage.
 const int   CIRC_RH_ASSIST_MAX = 35;    // % ceiling for the humidity-assist ramp
 const float RH_ASSIST_BAND     = 10.0;  // RH span above RH_FOG_ON over which circ ramps up (e.g. 65→75)
+// Heater circ interlock: a radiant element (40W ceramic on D2) in still air stratifies —
+// heat pools up top while the canopy SHT31, the ONLY overtemp sensor (TEMP_SAFETY_F), reads
+// cooler air below and may never trip. So whenever the heater is energized, hold at least this
+// circ duty so the fan is never fully stopped next to a live element. At 1 this is the same
+// idle-mix trickle circ runs by day — the blade turns but moves little air, so it guards
+// against a dead-still hot pocket, NOT full convective mixing. Raise it (toward CIRC_DRYDOWN
+// = 35) if the ceramic-on-D2 run shows the upper chamber running away from the canopy sensor.
+const int   HEAT_CIRC_MIN = 1;          // % circ floor while the heater is on
 
 // --- Vent fan (fresh-air exchange with ambient) ---
 // Chamber is leaky, so leaks already supply fresh air — the timed exchange is off
@@ -99,7 +110,8 @@ const float VENT_EMERGENCY_F = 99.0; // hard backstop: force vent full OVER manu
 // recovered humidity hugely with little temp cost). It keeps chipping at the peak at this
 // ~25% duty until temp falls back under VENT_TEMP_OFF_F — and if it never does, it caps
 // the humidity damage rather than crashing RH continuously. (VENT_EMERGENCY_F still wins.)
-// The vent is binary (no PWM), so time-pulsing is the only way to get a fractional duty.
+// The cooling vent is still driven ON/OFF here (time-pulsing for fractional duty),
+// even though the 4-wire fan can now PWM — pulsing is what recovers RH between bursts.
 const unsigned long VENT_PULSE_ON_MS  =  60UL * 1000;  // vent 1 min...
 const unsigned long VENT_PULSE_OFF_MS = 180UL * 1000;  // ...then off 3 min, repeat
 const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this...
@@ -213,6 +225,39 @@ const unsigned long EXC_ARM_DWELL_MS = 2UL * 60 * 1000;    // trigger must persi
 const float EXC_STALL_MIN_KPA   = 0.03;               // VPD progress toward target that re-arms the stall clock
 const unsigned long EXC_STALL_WINDOW_MS = 1UL * 60 * 1000;  // no such progress this long → stalled, end the swing
 
+// --- Overnight moisture-export vent (controlMode 3 only) ------------------------------
+// The excursion's dry swing gives up at night: the floor reservoir re-humidifies as fast as the
+// vent exports, so the VPD-progress stall detector fires within ~1 min and the 12-min rest plateau
+// lets VPD collapse below 0.4 kPa for hours (6/26-27 telemetry: ~6 h/night < 0.4). But the lever
+// isn't actually futile — dpGap ~10°F means room air is genuinely drier, so exchanging it removes
+// water mass over the night; the stall test just can't see it on a 1-min VPD timescale. This runs a
+// gentle export during NIGHT phase gated on dpGap (real export), not VPD progress, and only below a
+// deep-wet floor (0.55) so the excursion still owns the hormetic chop in the 0.55–0.9 band. Heat is
+// untouched: the temp loop reheats the cooler incoming air, so vent+reheat = net dehumidify. Run at
+// vent speed 1 — the lowest duty (~1% PWM): visibly flutters the leaves but is near-silent, so it can
+// run continuously across the whole wet trough without the fan-runtime QoL cost of a 100% blast.
+const bool  NIGHT_EXPORT_ENABLED      = true;
+const int   NIGHT_EXPORT_DUTY         = 1;      // vent speed 1: gentle leaf-flutter exchange, near-silent
+const float NIGHT_EXPORT_VPD_ON       = 0.55;   // VPD sags below this (the wet trough) → start exporting...
+const float NIGHT_EXPORT_VPD_OFF      = 0.85;   // ...latched until pulled up into the night band (wide on-time)
+const float NIGHT_EXPORT_TEMP_FLOOR_F = 64.0;   // skip if canopy this cold — don't cold-stress; let heat win first
+// Short debounce only (not a long dwell): the 0.55/0.85 hysteresis band already prevents chatter, so this
+// just rejects single-sample sensor noise. Keeping it short means the gentle export re-engages almost
+// immediately when the air sags back wet, holding a tight floor instead of sawing down during a re-arm wait.
+const unsigned long NIGHT_EXPORT_DWELL_MS = 60UL * 1000;  // VPD below ON this long first (debounce sensor noise)
+
+// --- Stagnancy safeguard --------------------------------------------------------------
+// At night the excursion strategy holds circ OFF (below): the gentle vent/export moves the air, and a
+// running circ just fans the floor reservoir back into the air, fighting the drying. But with circ off,
+// a long calm stretch (no vent firing) can let the chamber air stratify and pool moisture on cold
+// surfaces. So if the vent (any exchange: cooling, RH relief, dry swing, or the gentle night export)
+// hasn't fired for STAGNANT_VENT_GAP_MS, restore a brief mold-safe circ pulse, until the vent runs
+// again (which resets the clock).
+const unsigned long STAGNANT_VENT_GAP_MS    = 1UL * 60 * 60 * 1000;  // no vent this long → start periodic stirs
+const unsigned long STAGNANT_STIR_PERIOD_MS = 30UL * 60 * 1000;      // one stir every 30 min while stagnant...
+const unsigned long STAGNANT_STIR_ON_MS     =  3UL * 60 * 1000;      // ...each stir runs circ for 3 min
+const int   STAGNANT_STIR_DUTY = 1;                                  // stir at speed 1 (the mold-safe floor) — gentle, vs circ OFF
+
 // ====================================================================
 
 // Sensor readings
@@ -237,6 +282,11 @@ unsigned long lastControl = 0, lastPublish = 0;
 unsigned long ventCycleStart = 0;
 unsigned long ventPulseStart = 0;   // anchors the cool-vent ON/OFF pulse to peak entry
 unsigned long rhHighSince = 0;      // when RH first crossed VENT_RH_ON (0 = not high); gates the dwell
+unsigned long nightExportSince = 0; // dwell clock while VPD below the night-export floor (0 = not low)
+bool   nightExportLatched = false;  // hysteresis latch between VPD_ON (0.55) and VPD_OFF (0.75)
+bool   nightExportOn = false;       // this cycle's export demand (drives vent @ speed 1, idles circ, status)
+unsigned long ventLastFired = 0;    // last time the vent moved air (any reason); gates the stagnancy stir
+bool   stagnantStirOn = false;      // this cycle's stagnancy-stir demand (status/telemetry)
 
 // Manual overrides — while *Until is in the future, that actuator is forced.
 unsigned long heatOverrideUntil = 0; bool heatOverrideOn  = false;
@@ -336,11 +386,23 @@ void writeCirc(int duty) {
     pinMode(PIN_CIRC_PWM, INPUT);      // Hi-Z: no sneak ground path through the PWM wire
   }
 }
-// Vent fan (2-wire) on a MOSFET: on/off only (full 12V), no PWM.
+// Vent fan (4-wire): same drive pattern as the circ fan — power gated by a low-side
+// MOSFET (true hard-off) + speed via PWM. When OFF, release the PWM pin to Hi-Z so
+// the fan can't back-feed to ground through the control wire and idle at min.
+// The on-demand control logic below still time-pulses ON/OFF (writeVent(100)/(0));
+// the PWM wire additionally enables real speed control via setVent and any future
+// analog vent effort.
 void writeVent(int duty) {
   if (duty < 0) duty = 0; if (duty > 100) duty = 100;
-  ventDuty = (duty > 0) ? 100 : 0; cloudVent = ventDuty;
-  writeRelay(PIN_VENT, duty > 0);
+  ventDuty = duty; cloudVent = duty;
+  if (duty > 0) {
+    writeRelay(PIN_VENT_PWR, true);                                       // power on
+    pinMode(PIN_VENT_PWM, OUTPUT);
+    analogWrite(PIN_VENT_PWM, map(duty, 0, 100, 0, 255), FAN_PWM_FREQ);   // speed
+  } else {
+    writeRelay(PIN_VENT_PWR, false);   // cut power (hard off)
+    pinMode(PIN_VENT_PWM, INPUT);      // Hi-Z: no sneak ground path through the PWM wire
+  }
 }
 
 bool valid(float t, float h) {
@@ -592,6 +654,7 @@ const char* regimeName(Regime r) { return r == RG_WET ? "WET" : (r == RG_DRY ? "
 // Excursion phase for telemetry; "" unless mode 3 is active.
 const char* excTag() {
   if (controlMode != MODE_EXCURSION) return "";
+  if (nightExportOn) return " ex=EXPORT";
   return excState == EX_DRY ? " ex=DRYING" : (excState == EX_MOIST ? " ex=MOIST" : " ex=REST");
 }
 
@@ -819,6 +882,38 @@ bool ventCools() {
   return true;
 }
 
+// Overnight moisture-export gate (controlMode 3). Fills the hole where the excursion's dry swing
+// stalls out at night and rests, letting VPD park below 0.4 kPa while the floor reservoir keeps
+// evaporating. Decides ON/OFF only — the duty (NIGHT_EXPORT_DUTY, speed 1) is applied in
+// ventAutoDuty. Runs on dpGap (room genuinely drier → exchange exports water mass), latched between
+// 0.55 and the night band floor, with the same "sustained, not instantaneous" dwell as every other
+// vent gate. Heat is untouched (the temp loop reheats the incoming air → net dehumidify).
+bool nightExportVentOn(unsigned long now) {
+  nightExportOn = false;
+  if (!NIGHT_EXPORT_ENABLED || controlMode != MODE_EXCURSION || !sensorsValid || curPhase != PH_NIGHT) {
+    nightExportLatched = false; nightExportSince = 0; return false;
+  }
+  // Physical export gate: room must be meaningfully drier in dew point (the same gate that arms a dry
+  // swing) and not in the DRY regime, or venting just churns near-equal air. Cold floor → let heat win.
+  bool canExport = dpGapValid && (dpGap >= EXC_DRY_ARM_GAP_F) && (curRegime != RG_DRY)
+                   && (ctrlTempF >= NIGHT_EXPORT_TEMP_FLOOR_F);
+  float vpd = computeVPD(ctrlTempF, ctrlRH);
+  if (!canExport || vpd < 0) { nightExportLatched = false; nightExportSince = 0; return false; }
+
+  // Latched hysteresis: arm once VPD has held below the wet-trough floor for the dwell; hold until
+  // pulled back up to the band floor so it doesn't chatter around a single threshold.
+  if (!nightExportLatched) {
+    if (vpd < NIGHT_EXPORT_VPD_ON) {
+      if (nightExportSince == 0) nightExportSince = now;
+      if (now - nightExportSince >= NIGHT_EXPORT_DWELL_MS) nightExportLatched = true;
+    } else nightExportSince = 0;
+  } else if (vpd >= NIGHT_EXPORT_VPD_OFF) {
+    nightExportLatched = false; nightExportSince = 0;
+  }
+  nightExportOn = nightExportLatched;
+  return nightExportOn;
+}
+
 // Vent fan (reactive): above VENT_TEMP_ON_F, PULSE-cool (short bursts so RH recovers)
 // while venting can actually help; plus an always-allowed continuous high-RH relief
 // valve. (Periodic exchange schedule optional.)
@@ -862,7 +957,12 @@ int ventAutoDuty(unsigned long now) {
   else if (controlMode == MODE_REGIME_PI)    dryVentOn = piPulseOn(piState.ventEffort, VPD_VENT_MIN_EFFORT, ventPiWin, now);
   else if (controlMode == MODE_VPD_BANGBANG) dryVentOn = vpdWantDryVent(now);
 
-  return (exchangeWindow || coolPulseOn || rhVentOn || dryVentOn) ? VENT_DUTY : 0;
+  // Overnight gentle export runs the vent at speed 1 — but any full-duty reason (cooling, RH relief,
+  // active dry swing, scheduled exchange) outranks it. Always evaluate it so its latch + circ-idle
+  // flag stay current even when a full-duty reason is also firing.
+  bool nightExport = nightExportVentOn(now);
+  if (exchangeWindow || coolPulseOn || rhVentOn || dryVentOn) return VENT_DUTY;
+  return nightExport ? NIGHT_EXPORT_DUTY : 0;
 }
 
 void control() {
@@ -942,11 +1042,27 @@ void control() {
   // to 100%. Forced convection over the standing floor water evaporates it straight back into
   // the air (RH up, VPD down — worst at night), fighting the excursion. Let the vent dry; circ
   // just idles at the mold-safe floor. (Fog still wins for mist dispersion if temp-cooling fires.)
-  bool excDrying = (controlMode == MODE_EXCURSION && excState == EX_DRY);
+  bool excDrying = (controlMode == MODE_EXCURSION && (excState == EX_DRY || nightExportOn));
   int circReq;
   if      (circManual)          circReq = circOverrideDuty;
   else if (excDrying && !fogOn)  circReq = CIRC_MIX_DUTY;
   else                           circReq = circAutoDuty(fogOn, ventReq > 0, vpdWantDryDown());
+  // At NIGHT under the excursion strategy, take circ all the way OFF rather than idling it: the gentle
+  // vent/export moves the air, and a continuous circ just fans the floor reservoir back into the air
+  // (re-wetting, fighting the export) and adds runtime. Only drop the LOW/idle cases — fog dispersion
+  // and a real temp-cooling vent still need circ to feed them, so leave those untouched. The stagnancy
+  // stir (5c) restores a brief speed-1 pulse if the vent then stays quiet for an hour.
+  if (controlMode == MODE_EXCURSION && curPhase == PH_NIGHT && !circManual
+      && !fogOn && !tempVentOn && circReq < CIRC_FOG_DUTY)
+    circReq = 0;
+
+  // ===== 5a) HEATER CIRC INTERLOCK — circ must move air whenever the heater is on =====
+  // Above the night hard-zero (and above a manual hold: safety only RAISES the duty, so a manual
+  // setCirc >= HEAT_CIRC_MIN still wins, but you can't manually kill circ while the element cooks).
+  // Fog/vent-feed (100) already exceed this floor, so it only bites on the idle/off cases. Keyed on
+  // heatOn = the D2 relay state — so it covers the ceramic only once it's on D2 (external thermostat
+  // tonight = firmware can't see it, circ may still be zero while it fires).
+  if (heatOn && circReq < HEAT_CIRC_MIN) circReq = HEAT_CIRC_MIN;
 
   // ===== 5b) EMERGENCY BACKSTOP — only at a true runaway temp =====
   // Normal high-temp cooling is the vent hysteresis (VENT_TEMP_ON_F) + fog. This forces
@@ -955,6 +1071,22 @@ void control() {
   // (the 94° hysteresis already has the vent full by here); it just adds override-manual.
   // (Heater is already locked off at TEMP_SAFETY_F above; circ rides full with the vent.)
   if (sensorsValid && ctrlTempF >= VENT_EMERGENCY_F) { ventReq = VENT_DUTY; circReq = CIRC_FOG_DUTY; }
+
+  // ===== 5c) STAGNANCY STIR — if the vent hasn't moved air for an hour, restore a brief circ pulse =====
+  // With circ OFF at night (above), a long calm stretch can stratify the air. The clock resets whenever
+  // the vent fires for ANY reason (cooling, RH relief, dry swing, or the gentle night export); after
+  // STAGNANT_VENT_GAP_MS with no vent, run a short speed-1 circ stir every STAGNANT_STIR_PERIOD_MS.
+  // Manual circ holds and anything already faster (fog / vent feed) win — the stir only raises a too-low idle.
+  stagnantStirOn = false;
+  if (ventReq > 0) {
+    ventLastFired = now;
+  } else if (sensorsValid && !circManual && (now - ventLastFired) >= STAGNANT_VENT_GAP_MS) {
+    if ((now - ventLastFired) % STAGNANT_STIR_PERIOD_MS < STAGNANT_STIR_ON_MS
+        && circReq < STAGNANT_STIR_DUTY) {
+      circReq = STAGNANT_STIR_DUTY;
+      stagnantStirOn = true;
+    }
+  }
 
   writeCirc(circReq);
   writeVent(ventReq);
@@ -969,14 +1101,15 @@ void control() {
       heatOn ? "ON":"off", fogOn ? "ON":"off", circReq, ventReq, cloudMode);
   } else {
     snprintf(cloudStatus, sizeof(cloudStatus),
-      "T=%.1fF RH=%.0f%% VPD=%.2f | heat=%s fog=%s circ=%d%% vent=%d%% [%s] m%d %s gap=%.1f %s→%.2f%s%s%s%s%s",
+      "T=%.1fF RH=%.0f%% VPD=%.2f | heat=%s fog=%s circ=%d%% vent=%d%% [%s] m%d %s gap=%.1f %s→%.2f%s%s%s%s%s%s",
       ctrlTempF, ctrlRH, cloudVPD,
       heatOn ? "ON":"off", fogOn ? "ON":"off", circReq, ventReq, cloudMode,
       controlMode, regimeName(curRegime), cloudDpGap,
       phaseName(curPhase), cloudVpdTarget, sunDetected ? "(sun)" : "",
       overheat ? " OVERHEAT" : "",
       (ctrlRH >= RH_CEILING) ? " RH-ceiling" : "",
-      ventBelowRoom ? " BELOW-ROOM" : "", excTag());
+      ventBelowRoom ? " BELOW-ROOM" : "",
+      stagnantStirOn ? " STIR" : "", excTag());
   }
 }
 
@@ -1065,6 +1198,7 @@ int fnSetControlMode(String arg) {
   controlMode = m;
   piState.integ = 0; piState.fogEffort = 0; piState.ventEffort = 0;   // clean handoff
   excState = EX_REST; excRestUntil = 0; excArmSince = 0; excWantVent = false; excWantFog = false;
+  nightExportLatched = false; nightExportSince = 0; nightExportOn = false;   // clean handoff
   Particle.publish("everfresh/cmd", String::format("controlMode %d", controlMode), PRIVATE);
   return controlMode;
 }
@@ -1136,7 +1270,8 @@ void setup() {
   pinMode(PIN_FOG,      OUTPUT);
   pinMode(PIN_CIRC_PWM, OUTPUT);
   pinMode(PIN_CIRC_PWR, OUTPUT);
-  pinMode(PIN_VENT,     OUTPUT);
+  pinMode(PIN_VENT_PWM, OUTPUT);
+  pinMode(PIN_VENT_PWR, OUTPUT);
 
   // Known-safe boot state: everything off.
   writeRelay(PIN_HEAT, false);
