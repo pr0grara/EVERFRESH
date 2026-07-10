@@ -156,11 +156,15 @@ const int   PHASE_EVENING_START   = 16;   // [16,20) evening (sun-gated pulse)
 const int   PHASE_NIGHT_START     = 20;   // [20,6)  night
 
 // Per-phase canopy VPD bands (kPa)
-const float VPD_NIGHT_LO = 0.75, VPD_NIGHT_HI = 0.9;   // raised: drier recovery night (mid 0.825)
-const float VPD_MORN_LO  = 0.8, VPD_MORN_HI  = 1.1;
-const float VPD_AFT_LO   = 1.0, VPD_AFT_HI   = 1.3;
-const float VPD_EVE_LO   = 1.3, VPD_EVE_HI   = 1.8;   // only when sun detected
-const float VPD_EVE_CAP  = 2.2;                       // intervene-above ceiling during the spike
+// 7/09 de-stress: pinnae not unfurling fully since the ceramic element went in (dry-air stress
+// during frond expansion). Whole ladder pulled down ~0.25-0.35 kPa + evening spike crushed so the
+// fog loop holds humidity up against the heater's drying. Frond expansion now sits in the 0.55-0.8
+// zone it wants. Gentle diurnal climb retained (still some chop) but capped well under the stress band.
+const float VPD_NIGHT_LO = 0.55, VPD_NIGHT_HI = 0.70;  // was 0.75/0.9 (mid 0.625)
+const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 0.80;  // was 0.8/1.1
+const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 0.95;  // was 1.0/1.3
+const float VPD_EVE_LO   = 0.85, VPD_EVE_HI   = 1.15;  // was 1.3/1.8; only when sun detected
+const float VPD_EVE_CAP  = 1.40;                       // was 2.2; intervene-above ceiling during the spike
 const float VPD_DEADBAND = 0.05;                      // anti-chatter on the VPD loop
 
 // Sun-detection gate for the evening pulse: sun = ambient OR canopy crosses threshold, sustained.
@@ -238,8 +242,8 @@ const unsigned long EXC_STALL_WINDOW_MS = 1UL * 60 * 1000;  // no such progress 
 // run continuously across the whole wet trough without the fan-runtime QoL cost of a 100% blast.
 const bool  NIGHT_EXPORT_ENABLED      = true;
 const int   NIGHT_EXPORT_DUTY         = 1;      // vent speed 1: gentle leaf-flutter exchange, near-silent
-const float NIGHT_EXPORT_VPD_ON       = 0.55;   // VPD sags below this (the wet trough) → start exporting...
-const float NIGHT_EXPORT_VPD_OFF      = 0.85;   // ...latched until pulled up into the night band (wide on-time)
+const float NIGHT_EXPORT_VPD_ON       = 0.35;   // 7/09: dropped from 0.55 so export won't fight the lower night band...
+const float NIGHT_EXPORT_VPD_OFF      = 0.55;   // ...only strips moisture in a genuinely-wet trough now (was 0.85)
 const float NIGHT_EXPORT_TEMP_FLOOR_F = 64.0;   // skip if canopy this cold — don't cold-stress; let heat win first
 // Short debounce only (not a long dwell): the 0.55/0.85 hysteresis band already prevents chatter, so this
 // just rejects single-sample sensor noise. Keeping it short means the gentle export re-engages almost
@@ -696,7 +700,11 @@ void vpdPIUpdate() {
   bool  wantFog  = (e < 0);                         // too dry  → fog
   float ventAuth = dpGapValid ? constrainf(dpGap / DPGAP_VENT_FULL_F, 0.0, 1.0) : 0.0;
   bool  ventFeasible = wantVent && (curRegime != RG_DRY) && (ventAuth > 0.0);
-  bool  fogFeasible  = wantFog  && (curRegime != RG_WET) && (ctrlRH < RH_CEILING);
+  // Fog gate is canopy-local only (below condensation ceiling) — NOT regime-gated. See the
+  // excursionUpdate() note: dpGap/regime governs the VENT lever (room-air exchange), but fog
+  // is a source and can moisten regardless of how wet the room is. Dropping curRegime != RG_WET
+  // stops WET-regime nights/floor-evaporation from stranding VPD above target.
+  bool  fogFeasible  = wantFog  && (ctrlRH < RH_CEILING);
   if (wantVent && ventAuth <= 0.0) ventBelowRoom = true;   // want to dry but gap≈0 → needs heat
 
   float p = VPD_KP * e;
@@ -762,7 +770,15 @@ void excursionUpdate() {
   // while the room is drier (dpGap > 0); fog is unsafe when water-loaded or already at the ceiling.
   float ventAuth = dpGapValid ? constrainf(dpGap / DPGAP_VENT_FULL_F, 0.0, 1.0) : 0.0;
   bool  canVent  = (curRegime != RG_DRY) && (ventAuth > 0.0);
-  bool  canFog   = (curRegime != RG_WET) && (ctrlRH < RH_CEILING);
+  // Fog is a SOURCE, not a room-air exchange, so room-relative moisture (dpGap/regime)
+  // is irrelevant to it — it can raise canopy RH no matter how wet the room is. Its only
+  // real limits are canopy-local: don't fog above the condensation ceiling. "Too dry" is
+  // established by the VPD band (wantMoist / EX_MOIST) below. The old `curRegime != RG_WET`
+  // clause was a venting interlock wrongly inherited by fog: it locked fog out whenever the
+  // chamber read wetter than the room (high dpGap from floor evaporation), stranding VPD
+  // above target — solving a non-problem (fog can't over-wet vs the room) by creating a real
+  // one. dpGap stays on VENT (canVent), where room-relative moisture is the actual physics.
+  bool  canFog   = (ctrlRH < RH_CEILING);
   // Stricter gate to START a dry swing: need a real dew-point gap, not just dpGap > 0, or the
   // vent churns near-equal air to the max-drive timeout for nothing. Continuation uses canVent.
   bool  armDry   = canVent && dpGapValid && (dpGap >= EXC_DRY_ARM_GAP_F);
