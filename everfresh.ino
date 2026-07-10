@@ -1,5 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
+ * Version: v1.2.2 (2026-07-09) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -98,12 +99,16 @@ const bool VENT_SCHEDULE_ENABLED = false;
 const int VENT_DUTY = 100;       // % when exchanging
 const unsigned long VENT_INTERVAL_MS = 120UL * 60 * 1000;  // exchange every 120 min (when enabled)
 const unsigned long VENT_DURATION_MS =  2UL * 60 * 1000;  // for 2 min
-// On-demand cooling vent, WIDE hysteresis. 6/20 finding: continuous venting barely
-// cooled (temp held ~88-90°F on fog alone) but crashed RH/VPD (VPD ~2.5 vented vs ~1.25
-// fog-only). So the vent now sleeps through the range fog can hold and only wakes for a
-// genuine peak, then hands straight back to fog. Runs full when on.
-const float VENT_TEMP_ON_F  = 94.0;  // vent ONLY above this (fog is the cooler from 84-94)
-const float VENT_TEMP_OFF_F = 90.0;  // ...shut off once back down here (fog takes over again)
+// On-demand cooling vent. PRIORITY RULE (7/09): the vent is the PREFERRED cooler because it
+// sheds heat WITHOUT adding water — but only when it actually cools, i.e. the room is cooler
+// than the canopy (ventCools(): canopy-ambient >= VENT_AMBIENT_DELTA_F). So it engages for
+// cooling from COOL_ON_F up whenever ventCools() holds, and fog is forced for cooling ONLY when
+// venting can't help (room >= canopy — the common case during the 4-8 PM spike, where the room
+// co-heats; empirically venting was the right move only ~16.5% of cooling-needed samples). The
+// 6/20 finding still stands — venting crashes RH/VPD (VPD ~2.5 vented vs ~1.25 fog) — so even as
+// primary cooler it PULSES (below) to let RH recover, and fog keeps its independent RH/VPD job.
+const float VENT_TEMP_ON_F  = COOL_ON_F;   // vent-cool from here up when ventCools() (was 94: vent-only-at-peak)
+const float VENT_TEMP_OFF_F = COOL_OFF_F;  // ...release once back under here
 const float VENT_EMERGENCY_F = 99.0; // hard backstop: force vent full OVER manual (runaway guard)
 // Above VENT_TEMP_ON_F the cooling vent PULSES instead of running continuously: short ON
 // bursts with long OFF gaps so RH/VPD recover between them (6/20: a 3-min vent-off
@@ -890,12 +895,15 @@ int circAutoDuty(bool fogActive, bool ventActive, bool dryDown) {
   return CIRC_MIX_DUTY + (int)((CIRC_RH_ASSIST_MAX - CIRC_MIX_DUTY) * frac);
 }
 
-// Does venting actually cool right now? Only if it pulls in cooler air. With a valid
-// ambient reading, require a real canopy-minus-ambient gap; without the sensor, trust
-// that the room is cooler than the sunlit tent during a spike.
+// Does venting actually cool right now? Only if it pulls in cooler air: require a real
+// canopy-minus-ambient gap from a VALID ambient reading. Without the sensor we return false —
+// we can't confirm venting cools, and the old "room is cooler during the spike" assumption is
+// BACKWARDS (6/22 finding: the room runs HOTTER than the tent then). So a sensor failure hands
+// cooling back to FOG rather than importing heat; the 99°F emergency backstop still forces the
+// vent on a true runaway. This is also the arbiter that suppresses fog-for-cooling in control().
 bool ventCools() {
   if (ambient.ok) return (ctrlTempF - ambient.tempF) >= VENT_AMBIENT_DELTA_F;
-  return true;
+  return false;
 }
 
 // Overnight moisture-export gate (controlMode 3). Fills the hole where the excursion's dry swing
@@ -998,20 +1006,20 @@ void control() {
     else                                        autoHeat = heatOn;
 
     if (controlMode == MODE_EXCURSION) {
-      // Excursion fog demand (moistening swing). Temp-cooling still overrides up; ceiling down.
+      // Excursion fog demand (moistening swing). Fog cools ONLY when venting can't (vent-first); ceiling down.
       autoFog = excWantFog;
-      if (ctrlTempF > COOL_ON_F) autoFog = true;
+      if (ctrlTempF > COOL_ON_F && !ventCools()) autoFog = true;
       if (ctrlRH >= RH_CEILING)  autoFog = false;
     } else if (controlMode == MODE_REGIME_PI) {
-      // PI fog effort → time-duty. Regime interlock already zeroed fogEffort in WET. Temp-
-      // cooling demand still overrides upward; RH ceiling stays a hard wet backstop.
+      // PI fog effort → time-duty. Regime interlock already zeroed fogEffort in WET. Fog cools
+      // ONLY when venting can't (vent-first); RH ceiling stays a hard wet backstop.
       autoFog = piPulseOn(piState.fogEffort, VPD_FOG_MIN_EFFORT, fogPiWin, now);
-      if (ctrlTempF > COOL_ON_F) autoFog = true;
+      if (ctrlTempF > COOL_ON_F && !ventCools()) autoFog = true;
       if (ctrlRH >= RH_CEILING)  autoFog = false;
     } else if (controlMode == MODE_VPD_BANGBANG) {
-      // Diurnal VPD bang-bang (center-restoring).
+      // Diurnal VPD bang-bang (center-restoring). Fog cools ONLY when venting can't (vent-first).
       autoFog = vpdWantFog(fogOn);
-      if (ctrlTempF > COOL_ON_F) autoFog = true;
+      if (ctrlTempF > COOL_ON_F && !ventCools()) autoFog = true;
       if (ctrlRH >= RH_CEILING)  autoFog = false;
     } else {
       // mode 0: original RH/temp bang-bang.
@@ -1024,6 +1032,7 @@ void control() {
       if (ctrlTempF > COOL_ON_F)       wantCooling = true;
       else if (ctrlTempF < COOL_OFF_F) wantCooling = false;
       else                             wantCooling = fogOn;
+      if (ventCools()) wantCooling = false;   // vent-first: let the vent shed heat, keep fog on RH duty
 
       autoFog = (wantHumidity || wantCooling);
       if (ctrlRH >= RH_CEILING) autoFog = false;
