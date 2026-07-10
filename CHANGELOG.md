@@ -4,6 +4,9 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.3 — 2026-07-09
+Expose firmware version as the `version` cloud variable (`particle get <device> version`) so a flash is verifiable remotely — closes the "was it actually flashed?" blind spot.
+
 ## v1.2.2 — 2026-07-09
 Vent-first cooling. Vent is now the preferred cooler whenever it actually cools (`ventCools()`: room ≥3°F cooler than canopy), engaging from 84°F up; fog is forced for cooling ONLY when venting can't (`!ventCools()`). Fog keeps its RH/VPD job. No-ambient fallback flipped to fog-cooling (was heat-importing venting).
 

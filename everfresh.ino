@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.2 (2026-07-09) — see CHANGELOG.md
+ * Version: v1.2.3 (2026-07-09) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -310,6 +310,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
+char   cloudVersion[16] = "v1.2.3";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1325,6 +1326,7 @@ void setup() {
   Particle.variable("vpdTarget",    cloudVpdTarget);
   Particle.variable("controlMode",  controlMode);
   Particle.variable("dpGap",        cloudDpGap);
+  Particle.variable("version",      cloudVersion);   // read with: particle get <device> version
 
   Particle.function("setFog",         fnSetFog);         // arg: "1"/"0" [,seconds]
   Particle.function("setHeat",        fnSetHeat);        // arg: "1"/"0" [,seconds]
