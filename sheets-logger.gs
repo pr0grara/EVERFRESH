@@ -136,6 +136,6 @@ function testWrite() {
                    1, 0, 60, 100, 'test', 'manual', 'on',
                    '{"note":"manual testWrite ok"}',
                    'evening', 1.55, 1,
-                   2, 63.6, 53.2, 10.4, 'WET', 0.45, 0.0]);
+                   2, 63.6, 53.2, 10.4, 'WET', 0.45, 0.0, 'v1.2.3']);
   Logger.log('testWrite appended a row to sheet ' + SHEET_ID);
 }
