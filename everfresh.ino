@@ -1248,13 +1248,14 @@ void publishTelemetry() {
     "\"at\":%.1f,\"arh\":%.0f,\"avpd\":%.2f,"
     "\"heat\":%d,\"fog\":%d,\"circ\":%d,\"vent\":%d,\"mode\":\"%s\","
     "\"phase\":\"%s\",\"vtgt\":%.2f,\"sun\":%d,"
-    "\"cm\":%d,\"cdp\":%.1f,\"adp\":%.1f,\"dpgap\":%.1f,\"rg\":\"%s\",\"veff\":%.2f,\"feff\":%.2f}",
+    "\"cm\":%d,\"cdp\":%.1f,\"adp\":%.1f,\"dpgap\":%.1f,\"rg\":\"%s\",\"veff\":%.2f,\"feff\":%.2f,"
+    "\"fw\":\"%s\"}",
     cloudCanopyT, cloudCanopyRH, cloudVPD,
     cloudAmbientT, cloudAmbientRH, cloudAmbientVPD,
     cloudHeat, cloudFog, circDuty, ventDuty, cloudMode,
     phaseName(curPhase), cloudVpdTarget, sunDetected ? 1 : 0,
     controlMode, cloudCanopyDP, cloudAmbientDP, cloudDpGap, regimeName(curRegime),
-    piState.ventEffort, piState.fogEffort);
+    piState.ventEffort, piState.fogEffort, cloudVersion);
   Particle.publish("everfresh/telemetry", json, PRIVATE);
 }
 

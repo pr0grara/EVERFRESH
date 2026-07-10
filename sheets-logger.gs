@@ -26,7 +26,8 @@ var HEADERS = ['published_at', 'date_time', 'event',
                'heat', 'fog', 'circ', 'vent', 'mode',
                'change', 'state', 'raw',
                'phase', 'vtgt', 'sun',    // VPD control: diurnal phase, active VPD target, sun-detected
-               'cmode', 'canopyDP', 'ambientDP', 'dpGap', 'regime', 'ventEff', 'fogEff'];   // regime-PI: mode, dew points, gap, regime, PI efforts
+               'cmode', 'canopyDP', 'ambientDP', 'dpGap', 'regime', 'ventEff', 'fogEff',   // regime-PI: mode, dew points, gap, regime, PI efforts
+               'fw'];   // running firmware version (telemetry rows) — stamps which build produced each row
 
 // Your timezone — a named zone so daylight-saving is handled automatically.
 // (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
@@ -93,7 +94,8 @@ function doPost(e) {
       pick('ev'), pick('state'),
       raw,
       pick('phase'), pick('vtgt'), pick('sun'),   // VPD control fields (telemetry rows only)
-      pick('cm'), pick('cdp'), pick('adp'), pick('dpgap'), pick('rg'), pick('veff'), pick('feff')
+      pick('cm'), pick('cdp'), pick('adp'), pick('dpgap'), pick('rg'), pick('veff'), pick('feff'),
+      pick('fw')
     ]);
 
     return ContentService
