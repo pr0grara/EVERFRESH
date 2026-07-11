@@ -4,6 +4,9 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.4 — 2026-07-10
+Fog no longer starves during solar bakes. In mode 3 the fogger was slaved to the excursion's MOIST swing, whose stall detector quit within ~1 min once a cooling-vent pulse re-dried the air, then forced a 12-min rest — so during the 7/09–10 4–8 PM spikes canopy VPD parked at 3–4 kPa (RH ~32%) while fog rested. Added an independent, continuous RH/VPD-hold fog term (center-restoring, evening-cap aware) that bypasses the excursion rest/stall/re-arm entirely: vent owns temperature, fog holds RH, both run together. Purely additive — vent-first cooling, fog-for-cooling (`!ventCools()`), and the 95% RH ceiling are unchanged.
+
 ## v1.2.3 — 2026-07-09
 Expose firmware version remotely: the `version` cloud variable (`particle get <device> version`) AND a `fw` field in the telemetry JSON → a `fw` column in the Sheet (requires the Apps Script redeploy). Closes the "was it actually flashed?" blind spot and stamps every logged row with the build that produced it.
 

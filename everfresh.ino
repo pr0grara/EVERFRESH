@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.3 (2026-07-09) — see CHANGELOG.md
+ * Version: v1.2.4 (2026-07-10) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -310,7 +310,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.3";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.4";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1009,6 +1009,16 @@ void control() {
     if (controlMode == MODE_EXCURSION) {
       // Excursion fog demand (moistening swing). Fog cools ONLY when venting can't (vent-first); ceiling down.
       autoFog = excWantFog;
+      // Independent RH/VPD-hold (7/10). The excursion's MOIST swing rests for EXC_REST_MS (+ re-arm dwell)
+      // after every swing, and its stall detector quits a swing in ~1 min whenever a cooling-vent pulse
+      // keeps re-drying the air (both levers share the canopy VPD signal, so venting reads as "fog isn't
+      // progressing"). That starved fog during the 7/09-10 solar bakes — canopy VPD parked at 3-4 kPa
+      // while fog sat in a 12-min rest and RH fell to ~32%. This term keeps fog servoing the active VPD
+      // band CONTINUOUSLY (center-restoring, evening-cap aware — same logic mode 1 uses), with NO
+      // reference to excState/rest/stall, so a solar spike gets near-constant fog for RH while the
+      // excursion/vent independently own temperature. It only fires when too DRY (VPD above band), so it's
+      // a no-op in the overnight wet trough; fog-for-cooling (below) and the RH ceiling are untouched.
+      if (vpdWantFog(fogOn))                      autoFog = true;
       if (ctrlTempF > COOL_ON_F && !ventCools()) autoFog = true;
       if (ctrlRH >= RH_CEILING)  autoFog = false;
     } else if (controlMode == MODE_REGIME_PI) {
