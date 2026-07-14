@@ -319,7 +319,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.4";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.5";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
