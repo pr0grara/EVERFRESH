@@ -4,6 +4,13 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.5 — 2026-07-14
+Cooling-vent overhaul: looser duty cap, higher band, elastic ambient-tracking release.
+
+- **Duty cap loosened.** Continuous-ON allowance 1 min→3 min and the forced break 3 min→1 min (25%→~75% ceiling). The pulse was never a fixed cycle — `tempVentOn` releases the vent the instant canopy hits the release point or the room stops being cooler, so a mid-burst temp drop still cuts it immediately; the ON time only caps a *sustained* excursion. The old 25% throttle protected RH between bursts, but v1.2.4's independent RH-hold fog now backfills humidity continuously, so the vent only needs a brief 1-min break for fog to work a closed chamber efficiently.
+- **Band raised.** `COOL_ON_F` 84→90, `COOL_OFF_F` 82→88 — a hot tropical afternoon regularly rides 85–100°F, so stop fighting heat until 90. `VENT_EMERGENCY_F` stays 99; vent left VPD-uninhibited on purpose (low ambient RH means the fogger can re-crash VPD fast).
+- **Elastic release.** The 3°F `VENT_AMBIENT_DELTA_F` gap did double duty (engage + release); split into `VENT_AMBIENT_DELTA_F`=3 (engage — a lead worth starting on) and `VENT_AMBIENT_DELTA_OFF`=1 (release — chase until the canopy is within 1°F of ambient). Net vent release = `max(COOL_OFF_F, ambient+1)`, so on a 92°F-ambient bake it vents 96→~93 and quits instead of pinning ON forever against an unreachable 88° (it can't pull below ambient). No-ambient fails closed → cooling hands to fog.
+
 ## v1.2.4 — 2026-07-10
 Fog no longer starves during solar bakes. In mode 3 the fogger was slaved to the excursion's MOIST swing, whose stall detector quit within ~1 min once a cooling-vent pulse re-dried the air, then forced a 12-min rest — so during the 7/09–10 4–8 PM spikes canopy VPD parked at 3–4 kPa (RH ~32%) while fog rested. Added an independent, continuous RH/VPD-hold fog term (center-restoring, evening-cap aware) that bypasses the excursion rest/stall/re-arm entirely: vent owns temperature, fog holds RH, both run together. Purely additive — vent-first cooling, fog-for-cooling (`!ventCools()`), and the 95% RH ceiling are unchanged.
 

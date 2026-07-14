@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.4 (2026-07-10) — see CHANGELOG.md
+ * Version: v1.2.5 (2026-07-14) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -59,8 +59,9 @@ const uint8_t ADDR_AMBIENT = 0x44;
 const float HEAT_ON_F     = 76.0;   // heater ON below this
 const float HEAT_OFF_F    = 78.5;   // heater OFF above this (hysteresis)
 const float TEMP_SAFETY_F = 92.0;   // canopy above this => heater hard OFF + "hot" alarm (no longer force-vents)
-const float COOL_ON_F     = 84.0;   // fog-for-cooling ON above this
-const float COOL_OFF_F    = 82.0;   // fog-for-cooling OFF below this
+const float COOL_ON_F     = 90.0;   // cooling (fog + vent) ON above this — raised 84→90 (7/14): a hot
+                                    // tropical afternoon regularly rides 85-100°F; don't fight heat until 90
+const float COOL_OFF_F    = 88.0;   // cooling OFF below this (fixed floor; vent adds an elastic ambient floor below)
 
 // --- Humidity setpoints (%RH) ---  target band 50–80
 const float RH_FOG_ON  = 65.0;   // fog (humidity) ON below this
@@ -108,25 +109,33 @@ const unsigned long VENT_DURATION_MS =  2UL * 60 * 1000;  // for 2 min
 // 6/20 finding still stands — venting crashes RH/VPD (VPD ~2.5 vented vs ~1.25 fog) — so even as
 // primary cooler it PULSES (below) to let RH recover, and fog keeps its independent RH/VPD job.
 const float VENT_TEMP_ON_F  = COOL_ON_F;   // vent-cool from here up when ventCools() (was 94: vent-only-at-peak)
-const float VENT_TEMP_OFF_F = COOL_OFF_F;  // ...release once back under here
+const float VENT_TEMP_OFF_F = COOL_OFF_F;  // ...release under here OR when the elastic ambient floor is hit (below)
 const float VENT_EMERGENCY_F = 99.0; // hard backstop: force vent full OVER manual (runaway guard)
-// Above VENT_TEMP_ON_F the cooling vent PULSES instead of running continuously: short ON
-// bursts with long OFF gaps so RH/VPD recover between them (6/20: a 3-min vent-off
-// recovered humidity hugely with little temp cost). It keeps chipping at the peak at this
-// ~25% duty until temp falls back under VENT_TEMP_OFF_F — and if it never does, it caps
-// the humidity damage rather than crashing RH continuously. (VENT_EMERGENCY_F still wins.)
-// The cooling vent is still driven ON/OFF here (time-pulsing for fractional duty),
-// even though the 4-wire fan can now PWM — pulsing is what recovers RH between bursts.
-const unsigned long VENT_PULSE_ON_MS  =  60UL * 1000;  // vent 1 min...
-const unsigned long VENT_PULSE_OFF_MS = 180UL * 1000;  // ...then off 3 min, repeat
+// Above VENT_TEMP_ON_F the cooling vent runs, but ON is CAPPED: it may run at most VENT_PULSE_ON_MS
+// continuously, then takes a forced VENT_PULSE_OFF_MS break before it's allowed to resume. The break
+// is a fog/RH-recovery + closed-chamber-efficiency window, NOT a fixed duty cycle — the vent releases
+// the instant cooling is satisfied (tempVentOn drops when ctrlTempF <= VENT_TEMP_OFF_F or !ventCools()),
+// so a mid-burst temp drop at, say, 75 s turns it OFF immediately; the 3-min figure only bounds a
+// SUSTAINED excursion. This is looser than the old 25% pulse because v1.2.4's independent RH-hold fog
+// now backfills humidity continuously (fog is the direct humidity lever), so the vent no longer has to
+// stay mostly-off to protect RH — it only pauses briefly so fog gets efficient closed-chamber windows.
+// (VENT_EMERGENCY_F still wins.) Driven ON/OFF here (time-pulsing) even though the 4-wire fan can PWM.
+const unsigned long VENT_PULSE_ON_MS  = 180UL * 1000;  // vent up to 3 min continuous...
+const unsigned long VENT_PULSE_OFF_MS =  60UL * 1000;  // ...then a forced 1 min off before it may resume
 const float VENT_RH_ON      = 88.0;  // vent to shed humidity above this...
 const unsigned long VENT_RH_DWELL_MS = 5UL * 60 * 1000;  // ...but only if held >=5 min
 const float VENT_RH_OFF     = 80.0;
-// Vent only cools if it pulls in cooler air. With a valid ambient reading, require the
-// canopy to be at least this much hotter than the room before venting to cool. Until
-// the ambient sensor is installed this guard is skipped (the room is known to be
-// cooler than the sunlit tent during the solar spike, so venting always helps then).
-const float VENT_AMBIENT_DELTA_F = 3.0;
+// Vent only cools if it pulls in cooler air, and it can never pull the canopy BELOW ambient — so
+// the cooling band is elastic against the room temperature (7/14). Two decoupled deltas:
+//   _ON  (3°): don't START venting unless the canopy leads the room by at least this — a gap worth exploiting.
+//   _OFF (1°): once running, keep chasing DOWN until the canopy is within this of ambient, then release —
+//              the last degree of approach costs the most airflow for the least drop, so quit early.
+// Net vent release = max(VENT_TEMP_OFF_F, ambient + VENT_AMBIENT_DELTA_OFF): ambient 92 → stop ~93;
+// cool room (ambient 78) → the fixed 88° floor takes over. ventCools() (the engage/fog-arbiter gate) uses _ON.
+// With no valid ambient reading both guards fail closed → cooling hands back to fog (6/22: the room runs
+// HOTTER than the tent during the spike, so the old "room is cooler" assumption was backwards).
+const float VENT_AMBIENT_DELTA_F   = 3.0;   // engage gap (also the ventCools() arbiter threshold)
+const float VENT_AMBIENT_DELTA_OFF = 1.0;   // release gap — how close to ambient the vent is allowed to chase
 
 // --- Min on/off times for on/off loads (anti-chatter, ms) ---
 const unsigned long HEAT_MIN_ON = 60000, HEAT_MIN_OFF = 60000;
@@ -954,9 +963,12 @@ int ventAutoDuty(unsigned long now) {
     // Cool-vent: above VENT_TEMP_ON_F enter PULSE mode (tempVentOn); leave under
     // VENT_TEMP_OFF_F or when venting can't cool. Anchor the pulse to entry so the first
     // ON burst hits the peak immediately, then cycle ON_MS on / OFF_MS off while in mode.
-    bool canCool = ventCools();
-    if (!tempVentOn && canCool && ctrlTempF >= VENT_TEMP_ON_F)         { tempVentOn = true; ventPulseStart = now; }
-    else if (tempVentOn && (!canCool || ctrlTempF <= VENT_TEMP_OFF_F)) tempVentOn = false;
+    bool canCoolOn  = ventCools();   // >= _ON gap: a lead worth STARTING to vent on
+    // Once running, keep chasing down to the tighter _OFF gap (elastic ambient floor). No valid
+    // ambient → fail closed (release), same as the engage gate.
+    bool canCoolOff = ambient.ok && (ctrlTempF - ambient.tempF) >= VENT_AMBIENT_DELTA_OFF;
+    if (!tempVentOn && canCoolOn && ctrlTempF >= VENT_TEMP_ON_F)          { tempVentOn = true; ventPulseStart = now; }
+    else if (tempVentOn && (!canCoolOff || ctrlTempF <= VENT_TEMP_OFF_F)) tempVentOn = false;
     if (tempVentOn) {
       unsigned long period = VENT_PULSE_ON_MS + VENT_PULSE_OFF_MS;
       coolPulseOn = ((now - ventPulseStart) % period) < VENT_PULSE_ON_MS;
