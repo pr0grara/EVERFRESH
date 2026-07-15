@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.6 (2026-07-14) — see CHANGELOG.md
+ * Version: v1.2.7 (2026-07-15) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -80,13 +80,10 @@ const int CIRC_MIX_DUTY = 1;    // % continuous mix speed (lower if floor over-d
 // dry-down). But the temp regime rose ~10°F — nights now run ~80°F / ~82% RH, so the risk inverted from
 // re-wetting to STAGNATION (still, warm, saturated air = fungal boundary layer on the leaves). Hold a
 // gentle real airflow at night instead of near-zero. Below the 35% desiccation-concern ceiling; tune freely.
-const int CIRC_NIGHT_MIN = 20;  // % circ floor at night in mode 3 (was hard 0). Raise for more stir / lower if it over-humidifies
-// At night circ is the PRIMARY RH lever (fog is off overnight): running it over the floor pool evaporates
-// water and holds RH up, no fogger needed. But if that drives canopy VPD under the wet floor (VPD_NIGHT_LO)
-// it's over-humidifying — instead of killing circ (stagnation risk), PULSE it: brief ON keeps air moving
-// for anti-stagnation while cutting continuous pool evaporation; the export vent does the actual drying.
-const unsigned long CIRC_NIGHT_WET_PULSE_ON_MS  =  60UL * 1000;   // too-wet: circ 1 min on...
-const unsigned long CIRC_NIGHT_WET_PULSE_OFF_MS = 240UL * 1000;   // ...then 4 min off (~20% time-duty), repeat
+const int CIRC_NIGHT_MIN = 1;   // % circ floor at night in mode 3 (was hard 0, briefly 20). A constant gentle
+                                // trickle — the blade turns but moves little air, so it's "never fully off" for
+                                // anti-stagnation, NOT a humidity lever. RH is left to the floor pool; fog is the
+                                // last-resort backstop (fires only if VPD exceeds the widened night band, >1.10).
 // RH-assist: as canopy RH sags from the top of the assist band down toward the fog-on
 // point, ramp circ speed from CIRC_MIX_DUTY up to CIRC_RH_ASSIST_MAX — driving more
 // floor-water evaporation to prop RH up *before* the fogger fires. Goal: flatten the
@@ -333,7 +330,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.6";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.7";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1045,10 +1042,6 @@ void control() {
       // excursion/vent independently own temperature. It only fires when too DRY (VPD above band), so it's
       // a no-op in the overnight wet trough; fog-for-cooling (below) and the RH ceiling are untouched.
       if (vpdWantFog(fogOn))                      autoFog = true;
-      // Night: fog OFF — circ over the floor pool is the night RH lever now (7/14), plant is asleep
-      // (stomata closed) so a loose VPD costs nothing. Placed BEFORE the cooling override so a freak
-      // hot night can still re-enable fog for cooling; the RH-hold/excursion night fog is what's killed.
-      if (curPhase == PH_NIGHT)                   autoFog = false;
       if (ctrlTempF > COOL_ON_F && !ventCools()) autoFog = true;
       if (ctrlRH >= RH_CEILING)  autoFog = false;
     } else if (controlMode == MODE_REGIME_PI) {
@@ -1113,20 +1106,13 @@ void control() {
   if      (circManual)          circReq = circOverrideDuty;
   else if (excDrying && !fogOn)  circReq = CIRC_MIX_DUTY;
   else                           circReq = circAutoDuty(fogOn, ventReq > 0, vpdWantDryDown());
-  // NIGHT circ = the primary RH lever (fog is off overnight). Hold continuous at CIRC_NIGHT_MIN to
-  // evaporate the floor pool and keep RH up + air moving (anti-stagnation; nights now run ~80°F/~82% RH,
-  // so stagnant saturated air is the fungal risk the old hard-zero ignored). ONLY back off if circ has
-  // pulled canopy VPD under the wet floor (VPD_NIGHT_LO) — and even then PULSE, never hard-off, so there's
-  // always some stir; the export vent does the real drying. Floor only RAISES a too-low idle; fog/vent-feed
-  // (100) and RH-assist (35) still win.
-  if (controlMode == MODE_EXCURSION && curPhase == PH_NIGHT && !circManual) {
-    int nightFloor = CIRC_NIGHT_MIN;
-    if (sensorsValid && computeVPD(ctrlTempF, ctrlRH) < VPD_NIGHT_LO) {   // over-wet → pulse instead of continuous
-      unsigned long period = CIRC_NIGHT_WET_PULSE_ON_MS + CIRC_NIGHT_WET_PULSE_OFF_MS;
-      nightFloor = (now % period) < CIRC_NIGHT_WET_PULSE_ON_MS ? CIRC_NIGHT_MIN : 0;
-    }
-    if (circReq < nightFloor) circReq = nightFloor;
-  }
+  // NIGHT: pin circ at a constant gentle trickle (CIRC_NIGHT_MIN) instead of the old hard-zero — never
+  // fully off (anti-stagnation), but low enough not to re-wet the floor pool or act as a humidity lever.
+  // RH is left to the pool + the last-resort fog (fires >1.10 band); the export vent still handles the wet
+  // side (VPD < VPD_NIGHT_LO). Floor only RAISES a too-low idle; fog/vent-feed (100) and RH-assist (35) win.
+  if (controlMode == MODE_EXCURSION && curPhase == PH_NIGHT && !circManual
+      && circReq < CIRC_NIGHT_MIN)
+    circReq = CIRC_NIGHT_MIN;
 
   // ===== 5a) HEATER CIRC INTERLOCK — circ must move air whenever the heater is on =====
   // Above the night hard-zero (and above a manual hold: safety only RAISES the duty, so a manual

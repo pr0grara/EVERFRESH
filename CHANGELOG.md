@@ -4,6 +4,12 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.7 — 2026-07-15
+Correct the v1.2.6 night behavior after seeing one night run: fog is a LAST RESORT, not disabled; circ trickles, doesn't blow.
+
+- **Fog re-enabled at night as a backstop.** Removed the `PH_NIGHT` fog-kill — fog follows the normal band again, so at night it fires only if canopy VPD exceeds the widened `VPD_NIGHT_HI` (1.10). The floor pool holds RH day-to-day; fog steps in only when a night goes genuinely dry. (Never wanted fog *off* — wanted it last.)
+- **Night circ pinned at 1%, not 20%.** `CIRC_NIGHT_MIN` 20→1: a constant gentle trickle (blade turns, little airflow) — never fully off for anti-stagnation, but low enough it doesn't re-wet the pool or act as a humidity lever. Dropped the wet-pulse (`CIRC_NIGHT_WET_PULSE_*`): moot at 1% (nothing to back off from) and it would have cut air movement exactly when RH is highest. The export vent still handles the wet side.
+
 ## v1.2.6 — 2026-07-14
 Night retune for the risen temp regime (nights climbed ~10°F, now ~80°F/~82% RH — the 7/09 VPD bands were set for cool nights). Circ becomes the night humidity lever; the fogger goes dark overnight.
 
