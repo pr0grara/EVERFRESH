@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.7 (2026-07-15) — see CHANGELOG.md
+ * Version: v1.2.8 (2026-07-15) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -186,8 +186,12 @@ const float VPD_NIGHT_LO = 0.55, VPD_NIGHT_HI = 1.10;  // wide night deadband (7
 // wet-side export; HI 0.70→1.10 lets the fogger stay out until the night is genuinely dry. Plant is asleep
 // (stomata closed, leaflets folded) so a loose VPD costs nothing, and nights now run ~10°F warmer — the old
 // tight band implicitly demanded ~82% RH. This ONLY quiets night fog; it does NOT dry the tent (that's LO).
-const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 0.80;  // was 0.8/1.1
-const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 0.95;  // was 1.0/1.3
+const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 0.95;  // widen+raise 7/15 (was 0.55/0.80; 7/09 de-stress was 0.8/1.1)
+const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 1.15;  // widen+raise 7/15 (was 0.70/0.95; 7/09 de-stress was 1.0/1.3)
+// 7/15 daytime widen+raise: floors kept (wet-side export unchanged — no extra daytime venting); fog-triggers
+// (HI) pushed up + deadbands widened for more hormetic stress + deeper "chop" (fewer, deeper fog cycles).
+// Walks back the 7/09 de-stress panic now that the pinnae recovered and the plant shrugged off ~2.0 kPa on
+// the 7/14 spike. Ladder preserved: morning HI 0.95 < afternoon 1.15 < evening cap 1.40. Evening band untouched.
 const float VPD_EVE_LO   = 0.85, VPD_EVE_HI   = 1.15;  // was 1.3/1.8; only when sun detected
 const float VPD_EVE_CAP  = 1.40;                       // was 2.2; intervene-above ceiling during the spike
 const float VPD_DEADBAND = 0.05;                      // anti-chatter on the VPD loop
@@ -330,7 +334,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.7";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.8";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;

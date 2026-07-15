@@ -4,6 +4,13 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.8 — 2026-07-15
+Widen + raise the daytime VPD bands — walk back the 7/09 de-stress now that the plant recovered and shrugged off ~2.0 kPa on the 7/14 spike.
+
+- **Morning** `VPD_MORN_HI` 0.80→0.95 (band 0.55–0.95; width 0.25→0.40).
+- **Afternoon** `VPD_AFT_HI` 0.95→1.15 (band 0.70–1.15; width 0.25→0.45).
+- Floors kept (0.55 / 0.70) — wet-side export unchanged, no extra daytime venting; widened upward only. Higher fog-triggers = more hormetic stress; wider deadbands = deeper "chop" (fewer, deeper fog cycles). Ladder preserved: morning 0.95 < afternoon 1.15 < evening cap 1.40. Evening/spike band untouched.
+
 ## v1.2.7 — 2026-07-15
 Correct the v1.2.6 night behavior after seeing one night run: fog is a LAST RESORT, not disabled; circ trickles, doesn't blow.
 
