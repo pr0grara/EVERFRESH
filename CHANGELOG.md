@@ -4,6 +4,13 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.6 — 2026-07-14
+Night retune for the risen temp regime (nights climbed ~10°F, now ~80°F/~82% RH — the 7/09 VPD bands were set for cool nights). Circ becomes the night humidity lever; the fogger goes dark overnight.
+
+- **Wider night VPD deadband.** `VPD_NIGHT_HI` 0.70→1.10 (floor `VPD_NIGHT_LO` stays 0.55). Plant is asleep (stomata closed, leaflets folded) so a loose VPD costs nothing.
+- **Fog off at night.** In mode 3, `curPhase == PH_NIGHT` forces `autoFog = false` — we rely on circ + the floor pool for RH, not the fogger. Placed before the cooling override so a freak hot night can still re-enable fog for cooling.
+- **Circ is the night RH lever (was hard-zero).** At night circ holds continuous `CIRC_NIGHT_MIN`=20% over the floor pool to evaporate water / keep RH up + air moving (anti-stagnation; stagnant warm saturated air is the new fungal risk the old zero ignored). It backs off ONLY if it drives canopy VPD under the wet floor (`VPD_NIGHT_LO`) — and even then it PULSES (`CIRC_NIGHT_WET_PULSE_ON/OFF`, 1 min on / 4 min off) rather than hard-off, so there's always some stir; the export vent does the real drying. Floor only raises a too-low idle; fog/vent-feed (100) and RH-assist (35) still win.
+
 ## v1.2.5 — 2026-07-14
 Cooling-vent overhaul: looser duty cap, higher band, elastic ambient-tracking release.
 
