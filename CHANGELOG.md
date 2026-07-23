@@ -4,6 +4,15 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.10 — 2026-07-23
+Gentle de-stress: partial walk-back of the 7/15b ladder raise after drying pinnae reappeared.
+
+- **Morning** `VPD_MORN_HI` 1.20→1.10 (band 0.55–1.10).
+- **Afternoon** `VPD_AFT_HI` 1.30→1.20 (band 0.70–1.20).
+- **Evening** `VPD_EVE_HI` 1.30→1.20 and spike cap `VPD_EVE_CAP` 1.50→1.45.
+- Floors untouched (0.55/0.70/0.85) — wet side and daytime venting unchanged; this only makes fog trigger sooner. Ladder still non-decreasing (night 1.10 = morning 1.10 < afternoon 1.20 < evening cap 1.45) and morning is back under the old afternoon.
+- **Trigger:** ~10 drying pinnae on the leaf nearest the ceramic element + ~5 scattered plant-wide — the same signature as the 7/09 episode that the 7/15a/b raises walked back. Deliberately ~half-way back, not a full revert: this is a monitor-and-adjust step, not an abandonment of the hormetic ladder. See OBSERVATIONS.md 2026-07-23, including a suspected leaf-on-sensor fault that could be biasing canopy RH high (and therefore VPD low) independent of any setpoint.
+
 ## v1.2.9 — 2026-07-15
 Raise the whole hormetic VPD ladder — strictly ascending fog-triggers through the day.
 

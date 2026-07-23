@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.9 (2026-07-15) — see CHANGELOG.md
+ * Version: v1.2.10 (2026-07-23) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -186,15 +186,18 @@ const float VPD_NIGHT_LO = 0.55, VPD_NIGHT_HI = 1.10;  // wide night deadband (7
 // wet-side export; HI 0.70→1.10 lets the fogger stay out until the night is genuinely dry. Plant is asleep
 // (stomata closed, leaflets folded) so a loose VPD costs nothing, and nights now run ~10°F warmer — the old
 // tight band implicitly demanded ~82% RH. This ONLY quiets night fog; it does NOT dry the tent (that's LO).
-const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 1.20;  // raised ladder 7/15b (was 0.95; 7/15a 0.80; 7/09 1.1)
-const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 1.30;  // raised ladder 7/15b (was 1.15; 7/15a 0.95; 7/09 1.3)
-// 7/15b hormetic ladder raise: fog-triggers (HI) stepped UP and strictly ascending through the day —
-// night 1.10 < morning 1.20 < afternoon 1.30 < evening cap 1.50. Floors kept (0.55/0.70/0.85 — wet-side
-// export unchanged, no extra daytime venting), so bands widen upward = deeper "chop" + more stress. Morning
-// is now DRIER than the old afternoon (a real transpiration driver, not a gentle ramp) — deliberate. Plant
-// took ~2.0 kPa fine on the 7/14 spike, so these fog-triggers (all < 2.0) sit inside proven tolerance.
-const float VPD_EVE_LO   = 0.85, VPD_EVE_HI   = 1.30;  // 7/15b (was 1.15); only when sun detected
-const float VPD_EVE_CAP  = 1.50;                       // 7/15b (was 1.40); solar-window fog trigger / ceiling
+const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 1.10;  // 7/23 down-tick (7/15b 1.20; 7/15a 0.95; 7/09 0.80)
+const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 1.20;  // 7/23 down-tick (7/15b 1.30; 7/15a 1.15)
+// 7/23 gentle de-stress — partial walk-back of the 7/15b ladder raise. Drying pinnae reappeared: ~10 on the
+// leaf nearest the ceramic element plus ~5 scattered plant-wide. Same signature as the 7/09 episode (which
+// also began after the ceramic element went in), so the raised fog-triggers are letting the heater's dry-air
+// bite again. Roughly half-way back, not a full revert: morning 1.20→1.10, afternoon 1.30→1.20, evening
+// 1.30→1.20, spike cap 1.50→1.45. Floors untouched (0.55/0.70/0.85) — wet side unchanged, this only makes
+// fog come on sooner. Ladder stays non-decreasing (night 1.10 = morning 1.10 < afternoon 1.20 < eve cap
+// 1.45); morning sits back under the old afternoon. Everything else about the hormetic strategy is intact —
+// this is a monitor-and-adjust step, so re-read the pinnae before moving it again in either direction.
+const float VPD_EVE_LO   = 0.85, VPD_EVE_HI   = 1.20;  // 7/23 (7/15b 1.30); only when sun detected
+const float VPD_EVE_CAP  = 1.45;                       // 7/23 (7/15b 1.50); solar-window fog trigger / ceiling
 const float VPD_DEADBAND = 0.05;                      // anti-chatter on the VPD loop
 
 // Sun-detection gate for the evening pulse: sun = ambient OR canopy crosses threshold, sustained.
@@ -335,7 +338,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.9";    // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.10";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;

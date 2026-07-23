@@ -7,6 +7,44 @@ control logic). Plant-behavior cues here are as valuable as the sensor data.
 
 ---
 
+## 2026-07-23
+
+- **Drying pinnae are back, and the pattern points at the ceramic element again.** ~10 drying
+  pinnae on a single leaf sitting near the ceramic heater, plus ~5 more scattered plant-wide.
+  Ara's read: it started after the heater. That is the **same signature as the 7/09 episode**
+  ("pinnae not unfurling fully since the ceramic element went in — dry-air stress during frond
+  expansion"), which is what prompted the original de-stress ladder pull-down. The 7/15a and
+  7/15b ladder raises walked that de-stress back, and the symptom returned. Treat the ceramic
+  heater as a standing desiccation source that the fog loop has to be tuned *against*, not as a
+  one-time event we already solved.
+- **Two distinct populations, probably two causes.** The ~10 on the heater-adjacent leaf are
+  concentrated and local → radiant/convective load on that specific leaf, a *placement* problem
+  more than a setpoint problem. The ~5 scattered elsewhere are chamber-wide → that's the part
+  the VPD ladder is responsible for. Fixing one won't fix the other; the down-tick below only
+  addresses the scattered five.
+- **⚠️ Suspected sensor contact — highest-priority thing to check physically.** Ara noted the
+  affected leaf was *possibly touching the canopy SHT31*. If true this is not a cosmetic detail,
+  it corrupts the control point: a leaf against the sensor puts its own humid transpiration
+  boundary layer over the element, so the sensor reads RH **too high** → computed canopy VPD too
+  **low** → the controller believes the chamber is wetter than it is and under-fogs. That single
+  fault would explain the plant-wide drying without any setpoint being wrong at all. **Check and
+  clear the sensor before drawing conclusions from this cycle's telemetry** — otherwise the
+  down-tick is being evaluated against a lying sensor.
+- **Otherwise the plant is doing well.** Trunk thickened, height added, leaves maturing (pinnae
+  swelling), roots beginning to circle. The hormetic program is broadly working; this is a trim,
+  not a retreat.
+- **Roots circling → transplant due.** Logging it here as the next physical intervention. Worth
+  sequencing deliberately: transplanting is itself a real stressor, so don't stack it on top of
+  an unresolved desiccation problem. Sensor check and the VPD down-tick first, confirm recovery,
+  then pot up.
+- **Action taken: v1.2.10 gentle VPD down-tick** (flashed OTA same day). Morning HI 1.20→1.10,
+  afternoon 1.30→1.20, evening HI 1.30→1.20, spike cap 1.50→1.45. Floors untouched. Roughly
+  half-way back toward 7/15a rather than a full revert — fog now comes on sooner without
+  abandoning the ladder. **Monitor-and-adjust:** the pinnae are the dosimeter. Watch whether the
+  scattered drying arrests and whether the youngest leaf (the early-warning gauge, per 6/21)
+  opens cleanly tips-first in the morning. No further ladder moves until there's a plant-read to
+  justify one.
+
 ## 2026-06-21
 
 - **Overcast day = muted danger window (a natural "rest" day).** Direct A/B vs the
