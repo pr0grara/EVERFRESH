@@ -4,3 +4,6 @@ tools/.venv/
 tools/*.log
 __pycache__/
 *.pyc
+
+# raw telemetry exports pulled off the console for charting
+scratchpad_log.csv
