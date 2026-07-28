@@ -4,6 +4,15 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.11 — 2026-07-26
+Further gentle de-stress: another small ceiling down-tick after the 7/23 walk-back proved insufficient.
+
+- **Night/Morning** `VPD_NIGHT_HI`/`VPD_MORN_HI` 1.10→1.05.
+- **Afternoon** `VPD_AFT_HI` 1.20→1.15.
+- **Evening** `VPD_EVE_HI` 1.20→1.15 and spike cap `VPD_EVE_CAP` 1.45→1.40.
+- Floors still untouched (0.55/0.70/0.85) — wet side unchanged; this only makes fog trigger sooner. Ladder still non-decreasing (night 1.05 = morning 1.05 < afternoon 1.15 = evening HI 1.15 < cap 1.40).
+- **Trigger:** discoloration now appearing on some leaf **tips** (dry-air tip burn) — the 7/23 half-step wasn't enough to keep the ceramic heater's drying off the canopy. Same monitor-and-adjust discipline; re-read the tips before moving again.
+
 ## v1.2.10 — 2026-07-23
 Gentle de-stress: partial walk-back of the 7/15b ladder raise after drying pinnae reappeared.
 

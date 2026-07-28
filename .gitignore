@@ -7,3 +7,5 @@ __pycache__/
 
 # raw telemetry exports pulled off the console for charting
 scratchpad_log.csv
+
+.wrangler/

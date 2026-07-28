@@ -7,6 +7,32 @@ control logic). Plant-behavior cues here are as valuable as the sensor data.
 
 ---
 
+## 2026-07-26
+
+- **Discoloration on some leaf tips.** New symptom vs. 7/23's drying pinnae — now it's
+  browning/discoloration on the **tips** of some leaves. Classic dry-air tip burn. The 7/23
+  half-step walk-back wasn't enough to keep the ceramic heater's drying off the canopy, so the
+  fog-triggers came down another notch (below).
+- **✅ Sensor contact resolved — the 7/23 suspected fault is cleared.** Ara moved the canopy
+  SHT31 **down lower, below the leaf** so it's no longer nearly resting on it. That removes the
+  humid-transpiration-boundary-layer bias flagged on 7/23 (leaf on sensor → RH read too high →
+  VPD too low → chronic under-fogging). **This matters for reading everything after today:**
+  canopy RH/VPD from now on should be trusted where it wasn't before. If the tip discoloration
+  keeps progressing *after* both this sensor fix and the v1.2.11 down-tick, the cause is real
+  chamber dryness (or the local radiant load from the heater-adjacent leaf), not a lying sensor.
+  Watch whether canopy VPD now reads a touch higher than it did pre-move — that's the expected
+  direction if the leaf was inflating RH.
+- **Action taken: v1.2.11 gentle VPD down-tick** (flashed OTA same day, version confirmed live
+  on device). Ceilings only, ~0.05 kPa sooner fog everywhere: night/morning HI 1.10→1.05,
+  afternoon HI 1.20→1.15, evening HI 1.20→1.15, spike cap 1.45→1.40. Floors untouched
+  (0.55/0.70/0.85). Ladder still non-decreasing. Second de-stress step in a row; same
+  monitor-and-adjust discipline — re-read the tips before moving again.
+- **Still pending: transplant** (roots circling, noted 7/23). Sequence unchanged: confirm the
+  desiccation problem is actually resolved — now that the sensor is trustworthy and the ladder
+  is lower — before stacking the transplant stressor on top.
+
+---
+
 ## 2026-07-23
 
 - **Drying pinnae are back, and the pattern points at the ceramic element again.** ~10 drying
