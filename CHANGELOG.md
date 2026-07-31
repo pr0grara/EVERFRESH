@@ -4,6 +4,12 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.12 — 2026-07-28
+Night vent noise cap. Full-duty venting (cooling pulse / RH relief / dry swing / scheduled exchange) was a 100% blast — too loud at night.
+
+- **Night only:** those reasons now soft-start at `NIGHT_VENT_START_PCT` 10% and ramp to a `NIGHT_VENT_MAX_PCT` 50% ceiling over `NIGHT_VENT_RAMP_MS` (5 min), so brief blips stay ~quiet and only a sustained need climbs to the cap.
+- **Untouched:** near-silent moisture-export vent (~1%), the `VENT_EMERGENCY_F` runaway backstop (still forces 100%), and all daytime venting.
+
 ## v1.2.11 — 2026-07-26
 Further gentle de-stress: another small ceiling down-tick after the 7/23 walk-back proved insufficient.
 

@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.11 (2026-07-26) — see CHANGELOG.md
+ * Version: v1.2.12 (2026-07-28) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -289,6 +289,18 @@ const float NIGHT_EXPORT_TEMP_FLOOR_F = 64.0;   // skip if canopy this cold — 
 // immediately when the air sags back wet, holding a tight floor instead of sawing down during a re-arm wait.
 const unsigned long NIGHT_EXPORT_DWELL_MS = 60UL * 1000;  // VPD below ON this long first (debounce sensor noise)
 
+// --- Night full-duty vent cap (noise) -------------------------------------------------
+// The full-duty vent (cooling pulse / RH relief / dry swing / scheduled exchange) normally runs at
+// VENT_DUTY = 100% — too loud at night, next to a sleeping house. During PH_NIGHT those reasons
+// instead SOFT-START: the fan opens at NIGHT_VENT_START_PCT and ramps linearly to a ceiling of
+// NIGHT_VENT_MAX_PCT over NIGHT_VENT_RAMP_MS while the demand stays on, so a brief blip stays quiet
+// (~10%) and only a sustained need climbs toward the 50% cap. The gentle moisture-export vent
+// (NIGHT_EXPORT_DUTY, ~1%) and the VENT_EMERGENCY_F runaway backstop (still forces 100%) are NOT
+// capped — safety and the near-silent trickle are untouched. Daytime venting is unaffected.
+const int   NIGHT_VENT_START_PCT = 10;   // soft-start duty when a full-duty vent reason first fires at night
+const int   NIGHT_VENT_MAX_PCT   = 50;   // hard ceiling on night full-duty venting (was 100 — too loud)
+const unsigned long NIGHT_VENT_RAMP_MS = 5UL * 60 * 1000;  // linear ramp START→MAX over this while demand holds
+
 // --- Stagnancy safeguard --------------------------------------------------------------
 // At night the excursion strategy holds circ OFF (below): the gentle vent/export moves the air, and a
 // running circ just fans the floor reservoir back into the air, fighting the drying. But with circ off,
@@ -329,6 +341,7 @@ unsigned long nightExportSince = 0; // dwell clock while VPD below the night-exp
 bool   nightExportLatched = false;  // hysteresis latch between VPD_ON (0.55) and VPD_OFF (0.75)
 bool   nightExportOn = false;       // this cycle's export demand (drives vent @ speed 1, idles circ, status)
 unsigned long ventLastFired = 0;    // last time the vent moved air (any reason); gates the stagnancy stir
+unsigned long nightVentFullStart = 0; // when the current night full-duty vent episode began (0 = none); anchors the soft-start ramp
 bool   stagnantStirOn = false;      // this cycle's stagnancy-stir demand (status/telemetry)
 
 // Manual overrides — while *Until is in the future, that actuator is forced.
@@ -344,7 +357,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.11";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.12";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1023,7 +1036,23 @@ int ventAutoDuty(unsigned long now) {
   // active dry swing, scheduled exchange) outranks it. Always evaluate it so its latch + circ-idle
   // flag stay current even when a full-duty reason is also firing.
   bool nightExport = nightExportVentOn(now);
-  if (exchangeWindow || coolPulseOn || rhVentOn || dryVentOn) return VENT_DUTY;
+  if (exchangeWindow || coolPulseOn || rhVentOn || dryVentOn) {
+    // Full-duty reason firing. At night, soft-start + cap it for noise instead of a 100% blast:
+    // open at NIGHT_VENT_START_PCT, ramp to NIGHT_VENT_MAX_PCT over NIGHT_VENT_RAMP_MS while demand
+    // holds. (The VENT_EMERGENCY_F backstop in control() still forces true 100% on a runaway.)
+    if (curPhase == PH_NIGHT) {
+      if (nightVentFullStart == 0) nightVentFullStart = now;
+      unsigned long held = now - nightVentFullStart;
+      int span = NIGHT_VENT_MAX_PCT - NIGHT_VENT_START_PCT;
+      int duty = (held >= NIGHT_VENT_RAMP_MS)
+                   ? NIGHT_VENT_MAX_PCT
+                   : NIGHT_VENT_START_PCT + (int)((long)span * held / NIGHT_VENT_RAMP_MS);
+      return duty;
+    }
+    nightVentFullStart = 0;   // daytime full-duty runs uncapped
+    return VENT_DUTY;
+  }
+  nightVentFullStart = 0;     // demand cleared → reset the ramp anchor
   return nightExport ? NIGHT_EXPORT_DUTY : 0;
 }
 
