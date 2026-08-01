@@ -18,10 +18,13 @@ Earring Tree), a tropical legume, on a **Particle Photon**.
 
 ## How it works
 
-**Two SHT31 sensors** over one I²C bus:
-- **canopy** (`0x44`) — the **control point**; every decision uses this.
-- **ambient** (`0x45`) — room air (what the vent pulls in); logged, **and gates vent
-  cooling** — the vent only cools when the room is meaningfully cooler than the canopy.
+**Two SHT31 sensors**, each on its **own I²C bus** (both fixed at `0x44`):
+- **canopy** (`0x44`, **hardware I²C** on D0/D1) — the **control point**; every decision uses this.
+- **ambient** (`0x44`, **software/bit-banged I²C** on D5/D6) — room air (what the vent
+  pulls in); logged, **and gates vent cooling** — the vent only cools when the room is
+  meaningfully cooler than the canopy. On its **own bit-banged bus** because the sealed
+  waterproof module is address-locked at `0x44`, same as the canopy sensor, so the two
+  can't share a bus.
 
 **Four actuators:**
 - **HEAT** — 120 VAC heater via SSR (on/off).
@@ -30,9 +33,11 @@ Earring Tree), a tropical legume, on a **Particle Photon**.
 - **CIRC** — 4-wire PWM circulation fan: **internal mixing, no fresh air**. Full speed
   during any active cooling (fog mist-dispersion or venting) + **continuous gentle
   mixing** between cycles.
-- **VENT** — 2-wire exchange fan via MOSFET: **fresh-air exchange** with ambient.
-  On-demand — cooling (when the room can actually help) + high-RH safety. (Scheduled
-  exchange is off while the chamber is leaky; re-enable once it's sealed.)
+- **VENT** — 4-wire PWM exchange fan (PWM on WKP, power via a low-side MOSFET on A4):
+  **fresh-air exchange** with ambient. On-demand — cooling (when the room can actually
+  help) + high-RH safety. (Scheduled exchange is off while the chamber is leaky; re-enable
+  once it's sealed.) The firmware currently drives it **hard on/off** despite the
+  PWM-capable hardware.
 
 Control is **hysteresis bang-bang** for heat and fog (RH is the humidity loop), and
 temperature-reactive threshold logic for the fans. VPD is computed on-device and logged.
@@ -46,12 +51,12 @@ temperature-reactive threshold logic for the fans. VPD is computed on-device and
 | Qty | Part                              | Notes                                              |
 |-----|-----------------------------------|----------------------------------------------------|
 | 1   | Particle Photon                   | (Photon 2 / Argon also fine)                       |
-| 2   | SHT31-D breakout                  | I²C; canopy ADDR→GND (0x44), ambient ADDR→3V3 (0x45) |
+| 2   | SHT31-D breakout                  | Both fixed at 0x44 — canopy on hardware I²C (D0/D1), ambient on its own software I²C bus (D5/D6) |
 | 1   | Solid-state relay (SSR), 3–32 V in | For the 120 VAC heater — **use an SSR, not mechanical** |
 | 3   | Logic-level N-ch MOSFET (or module) | Fogger (24 V), vent fan (12 V), circ-fan power (12 V) |
 | 2   | Flyback diode (1N5819)            | Across each fan motor (vent, circ)                 |
 | 1   | 4-wire PWM fan                    | Circulation (internal mixing)                      |
-| 1   | 2-wire fan                        | Vent / air exchange                                |
+| 1   | 4-wire PWM fan                    | Vent / air exchange (PWM on WKP, power via low-side MOSFET) |
 | 1   | Ultrasonic fogger (24 V)          | + reservoir                                        |
 | —   | 12 V + 24 V + 5 V/USB supplies    | 12 V fans, 24 V fogger, 5 V Photon                 |
 
@@ -63,12 +68,14 @@ temperature-reactive threshold logic for the fans. VPD is computed on-device and
 
 | Pin   | Drives                          | Element            |
 |-------|---------------------------------|--------------------|
-| D0/D1 | both SHT31 (SDA/SCL)            | I²C                |
+| D0/D1 | canopy SHT31 (SDA/SCL)          | hardware I²C       |
+| D5/D6 | ambient SHT31 (SDA/SCL)         | software I²C (bit-banged) |
 | D2    | heater                          | SSR (on/off)       |
 | D3    | fogger transducer (24 V)        | MOSFET (on/off)    |
 | A5    | circ fan **PWM wire** (speed)   | direct to 4-wire fan |
 | D4    | circ fan **power** (true off)   | MOSFET (low-side)  |
-| A4    | vent fan (2-wire)               | MOSFET (on/off)    |
+| WKP   | vent fan **PWM wire** (speed)   | direct to 4-wire fan |
+| A4    | vent fan **power** (hard off)   | MOSFET (low-side)  |
 
 ---
 
@@ -77,8 +84,8 @@ temperature-reactive threshold logic for the fans. VPD is computed on-device and
 ### Sensors (I²C, 3.3 V)
 
 ```
-canopy  SHT31  VIN→3V3 GND→GND SDA→D0 SCL→D1  ADDR→GND  (= 0x44)
-ambient SHT31  VIN→3V3 GND→GND SDA→D0 SCL→D1  ADDR→3V3  (= 0x45)
+canopy  SHT31  VIN→3V3 GND→GND SDA→D0 SCL→D1  (hardware I²C, 0x44)
+ambient SHT31  VIN→3V3 GND→GND SDA→D5 SCL→D6  (own software I²C bus, also 0x44)
 ```
 
 ⚠️ Power sensors from **3V3**, not VIN — their onboard pull-ups must reference 3.3 V
@@ -115,6 +122,16 @@ Each switched load uses a logic-level N-channel MOSFET on the **ground** side:
     wire and idle at min RPM. The firmware **releases the PWM pin to Hi-Z when off**
     to kill that path; a connected tach wire would reopen it.
 
+### Vent fan (4-wire) — two pins
+
+Wires identically to the circ fan:
+- **PWM wire → WKP** (speed; 25 kHz, driven straight from the Photon).
+- **Power via a low-side MOSFET on A4** — gives a **hard off**; the firmware releases the
+  PWM pin to Hi-Z when off so the fan can't back-feed to ground and idle at min.
+- **Cut and insulate the tach wire** (same signal-wire back-feed path as the circ fan).
+- The control logic below drives it **on/off** (time-pulsing), even though the 4-wire fan
+  is PWM-capable.
+
 ### 120 VAC heater (SSR)
 
 `D2 → SSR DC+`, `GND → SSR DC−`. Switch only the **hot** conductor through the SSR's
@@ -134,9 +151,9 @@ All thresholds are in the `CONFIG` block of `everfresh.ino`.
 | Temp ≥ 92 °F (`TEMP_SAFETY_F`), any cause | hard OFF |
 
 ### Fogger (humidity + evaporative cooling)
-- **Humidity:** ON below `RH_FOG_ON` (65 %), OFF above `RH_FOG_OFF` (80 %).
-- **Cooling:** ON above `COOL_ON_F` (84 °F), OFF below `COOL_OFF_F` (82 °F).
-- **Hard ceiling:** never fog above `RH_CEILING` (90 %).
+- **Humidity:** ON below `RH_FOG_ON` (65 %), OFF above `RH_FOG_OFF` (90 %).
+- **Cooling:** ON above `COOL_ON_F` (90 °F), OFF below `COOL_OFF_F` (88 °F).
+- **Hard ceiling:** never fog above `RH_CEILING` (95 %).
 - ~30 s bursts. Min on/off timers prevent chatter.
 
 ### Circulation fan (internal mixing — no fresh air)
@@ -163,24 +180,28 @@ is a peak-shaver, not a continuous cooler** (see the 6/20 finding below).
 
 | Canopy temp | Response |
 |-------------|----------|
-| ≥ `COOL_ON_F` (84 °F) | **Fog** — evaporative cooling that holds temp ~88–90 °F *and* keeps RH/VPD in band (cut at `RH_CEILING`) |
-| ≥ `VENT_TEMP_ON_F` (94 °F) | **Vent PULSES** to shave a peak fog can't hold — 1 min on / 3 min off (~25 % duty) so RH recovers between bursts **+ circ full while venting**; pulsing stops once back under `VENT_TEMP_OFF_F` (90 °F) |
+| ≥ `COOL_ON_F` (90 °F) | **Fog** — evaporative cooling that holds temp ~88–90 °F *and* keeps RH/VPD in band (cut at `RH_CEILING`) |
+| ≥ `VENT_TEMP_ON_F` (90 °F) | **Vent PULSES** to shave a peak fog can't hold — 3 min on / 1 min off (~75 % duty) so RH recovers between bursts **+ circ full while venting**; pulsing stops once back under `VENT_TEMP_OFF_F` (88 °F) |
 | ≥ `VENT_EMERGENCY_F` (99 °F) | **Emergency**: vent + circ forced full *over* a manual hold (runaway guard) |
 | ≥ `TEMP_SAFETY_F` (92 °F) | Heater hard-off + "hot" alarm (does **not** force the vent) |
 
 > **6/20 finding — why the vent runs so little.** A 3-minute vent-off test during a live
 > solar spike: temp barely moved (~88–90 °F on fog alone) but **VPD halved** (~2.5 → ~1.25
 > kPa) and RH jumped 45→75 %. Continuous venting was paying a huge drying penalty for
-> almost no cooling — so the vent now only wakes above 94 °F and hands straight back to
-> fog at 90 °F. We optimize **VPD**, with temperature as a safety ceiling.
+> almost no cooling — so the vent now only wakes above 90 °F and hands straight back to
+> fog at 88 °F. We optimize **VPD**, with temperature as a safety ceiling.
 
 ### Vent fan (fresh-air exchange — on/off)
-On-demand only, since the leaky chamber already exchanges air passively:
-- **Cooling** (peak-shave): vent if temp ≥ `VENT_TEMP_ON_F` (94 °F, off below
-  `VENT_TEMP_OFF_F` 90 °F) — wide hysteresis so it dips a peak then gets out of fog's way.
-  Also gated on **whether venting actually cools** — with a valid ambient reading it
-  requires `canopy − ambient ≥ VENT_AMBIENT_DELTA_F` (3 °F). Until the ambient sensor is
-  installed the guard is skipped (the room is known cooler than the sunlit tent).
+On-demand only, since the leaky chamber already exchanges air passively. (The fan is a
+4-wire PWM unit but the firmware drives it hard on/off; the PWM wire enables future speed
+control.)
+- **Cooling** (peak-shave): vent if temp ≥ `VENT_TEMP_ON_F` (90 °F, off below
+  `VENT_TEMP_OFF_F` 88 °F) — hysteresis so it dips a peak then gets out of fog's way.
+  Also gated on **whether venting actually cools** — it requires a **valid ambient reading**
+  showing `canopy − ambient ≥ VENT_AMBIENT_DELTA_F` (3 °F). Without a valid ambient reading
+  the gate returns **false** (vent-cooling disabled, cooling hands back to fog) — the old
+  "room is cooler than the sunlit tent" assumption proved backwards (6/22: the room runs
+  *hotter* than the tent during the spike).
 - **Emergency backstop**: at `VENT_EMERGENCY_F` (99 °F) the vent is forced full *over* a
   manual hold — the only always-on protection if fog fails unattended (manual overrides
   auto-expire in ≤10 min anyway).
@@ -216,9 +237,9 @@ On-demand only, since the leaky chamber already exchanges air passively:
 | `RELAY_ACTIVE_LOW` | `false` | `false` = active-HIGH (SSR/MOSFET) |
 | `HEAT_ON_F` / `HEAT_OFF_F` | 76 / 78.5 | Heater band |
 | `TEMP_SAFETY_F` | 92 | Heater hard-off + "hot" alarm |
-| `COOL_ON_F` / `COOL_OFF_F` | 84 / 82 | Fog-for-cooling band |
-| `RH_FOG_ON` / `RH_FOG_OFF` | 65 / 80 | Fog (humidity) band |
-| `RH_CEILING` | 90 | Never fog above |
+| `COOL_ON_F` / `COOL_OFF_F` | 90 / 88 | Fog-for-cooling band |
+| `RH_FOG_ON` / `RH_FOG_OFF` | 65 / 90 | Fog (humidity) band |
+| `RH_CEILING` | 95 | Never fog above |
 | `CIRC_FOG_DUTY` | 100 | Circ % during any active cooling (fog or vent) |
 | `CIRC_MIX_DUTY` | (your fan's min) | Circ % for continuous between-cycle mixing; **0 disables mixing** |
 | `CIRC_RH_ASSIST_MAX` | 35 | Circ % ceiling for the RH-assist ramp (gentle, foliage-safe) |
@@ -226,11 +247,11 @@ On-demand only, since the leaky chamber already exchanges air passively:
 | `VENT_SCHEDULE_ENABLED` | `false` | Periodic exchange on/off — off while chamber is leaky |
 | `VENT_DUTY` | 100 | Vent on/off (on=full) |
 | `VENT_INTERVAL_MS` / `_DURATION_MS` | 120 / 2 min | Periodic exchange (when enabled) |
-| `VENT_TEMP_ON_F` / `_OFF_F` | 94 / 90 | Vent-to-cool band (wide — peak-shave only; fog holds 84–94) |
-| `VENT_PULSE_ON_MS` / `_OFF_MS` | 1 / 3 min | Cool-vent pulse: on/off duty above 94 °F (~25 %) |
+| `VENT_TEMP_ON_F` / `_OFF_F` | 90 / 88 | Vent-to-cool band (== fog cool band; vent-vs-fog arbitrated by `ventCools()`) |
+| `VENT_PULSE_ON_MS` / `_OFF_MS` | 3 / 1 min | Cool-vent pulse: on/off duty above 90 °F (~75 %) |
 | `VENT_EMERGENCY_F` | 99 | Force vent full over manual (runaway backstop) |
 | `VENT_RH_ON` / `_OFF` | 88 / 80 | Vent-to-shed-humidity band |
-| `VENT_AMBIENT_DELTA_F` | 3 | Min canopy − ambient gap to vent-cool (skipped w/o ambient sensor) |
+| `VENT_AMBIENT_DELTA_F` | 3 | Min canopy − ambient gap to vent-cool (no valid ambient reading → vent-cool disabled, falls back to fog) |
 | `HEAT_MIN_ON/OFF`, `FOG_MIN_ON/OFF` | 60s / 20s | Anti-chatter |
 
 ---
@@ -307,10 +328,10 @@ Forward these to Google Sheets per [LOGGING.md](LOGGING.md).
   airtight, so leaks already supply fresh air / CO₂. Scheduled exchange is therefore
   **off** (`VENT_SCHEDULE_ENABLED = false`); the vent is purely on-demand (cooling +
   high-RH safety). Re-enable the schedule once the chamber is sealed.
-- **4-wire fan + low-side power MOSFET:** with power cut, the fan back-feeds to
+- **4-wire fans + low-side power MOSFET:** with power cut, a 4-wire fan back-feeds to
   ground through its **signal wires** and idles. Fixed by releasing the PWM pin to
-  **Hi-Z when off** and cutting the tach wire. (2-wire fans don't have this — no
-  signal wires.)
+  **Hi-Z when off** and cutting the tach wire. Applies to **both** fans (circ and vent
+  are both 4-wire).
 - **Recirculation ≠ ventilation:** the circ fan mixes internal air (and evaporates
   floor water back into the chamber); only the vent exchanges with ambient. Decoupling
   them was the key architecture split.
@@ -326,12 +347,13 @@ Forward these to Google Sheets per [LOGGING.md](LOGGING.md).
 
 ## Open items / TODO
 
-- [ ] **Vent fan true-off check** — 2-wire on MOSFET stops cleanly; confirm in logs.
+- [ ] **Vent fan true-off check** — 4-wire fan: confirm the power MOSFET dead-stops it
+      (PWM pin released to Hi-Z, tach wire cut), same as circ; confirm in logs.
 - [ ] **Heater + SSR (Step 4)** — 120 VAC subsystem still to be wired.
 - [ ] **Fogger dry-run protection** — reservoir float switch on a GPIO.
 - [ ] **Flyback diodes** on the fan MOSFETs before permanent install.
-- [ ] **Install ambient SHT31 (0x45)** — arriving 6/21; activates the vent cooling
-      guard (`VENT_AMBIENT_DELTA_F`) automatically once it reads valid.
+- [ ] **Ambient SHT31 (0x44, own software I²C bus on D5/D6)** — activates the vent
+      cooling guard (`VENT_AMBIENT_DELTA_F`) automatically once it reads valid.
 - [ ] **RH floor check** — confirm the low-60s %RH settling point under continuous
       mixing isn't too dry for the plant (raise `RH_FOG_ON` if so).
 - [ ] **VPD-based control + day/night zones** — once enough logs are digested.
