@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.12 (2026-07-28) — see CHANGELOG.md
+ * Version: v1.2.13 (2026-08-04) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -182,12 +182,12 @@ const int   PHASE_NIGHT_START     = 20;   // [20,6)  night
 // during frond expansion). Whole ladder pulled down ~0.25-0.35 kPa + evening spike crushed so the
 // fog loop holds humidity up against the heater's drying. Frond expansion now sits in the 0.55-0.8
 // zone it wants. Gentle diurnal climb retained (still some chop) but capped well under the stress band.
-const float VPD_NIGHT_LO = 0.55, VPD_NIGHT_HI = 1.05;  // 7/26 down-tick (was 1.10). wide night deadband (7/14): floor 0.55 keeps the
+const float VPD_NIGHT_LO = 0.55, VPD_NIGHT_HI = 0.90;  // 8/04 recovery-week down-tick (was 1.05). wide night deadband (7/14): floor 0.55 keeps the
 // wet-side export; HI 0.70→1.10 lets the fogger stay out until the night is genuinely dry. Plant is asleep
 // (stomata closed, leaflets folded) so a loose VPD costs nothing, and nights now run ~10°F warmer — the old
 // tight band implicitly demanded ~82% RH. This ONLY quiets night fog; it does NOT dry the tent (that's LO).
-const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 1.05;  // 7/26 down-tick (7/23 1.10; 7/15b 1.20; 7/15a 0.95; 7/09 0.80)
-const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 1.15;  // 7/26 down-tick (7/23 1.20; 7/15b 1.30; 7/15a 1.15)
+const float VPD_MORN_LO  = 0.55, VPD_MORN_HI  = 0.90;  // 8/04 recovery-week (7/26 1.05; 7/23 1.10; 7/15b 1.20; 7/15a 0.95; 7/09 0.80)
+const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 1.00;  // 8/04 recovery-week (7/26 1.15; 7/23 1.20; 7/15b 1.30; 7/15a 1.15)
 // 7/23 gentle de-stress — partial walk-back of the 7/15b ladder raise. Drying pinnae reappeared: ~10 on the
 // leaf nearest the ceramic element plus ~5 scattered plant-wide. Same signature as the 7/09 episode (which
 // also began after the ceramic element went in), so the raised fog-triggers are letting the heater's dry-air
@@ -202,8 +202,16 @@ const float VPD_AFT_LO   = 0.70, VPD_AFT_HI   = 1.15;  // 7/26 down-tick (7/23 1
 // spike cap 1.45→1.40. Floors still untouched (0.55/0.70/0.85). Ladder still non-decreasing (night 1.05 =
 // morning 1.05 < afternoon 1.15 = eve HI 1.15 < cap 1.40). Same monitor-and-adjust discipline — re-read the
 // tips before moving again.
-const float VPD_EVE_LO   = 0.85, VPD_EVE_HI   = 1.15;  // 7/26 (7/23 1.20; 7/15b 1.30); only when sun detected
-const float VPD_EVE_CAP  = 1.40;                       // 7/26 (7/23 1.45; 7/15b 1.50); solar-window fog trigger / ceiling
+// 8/04 recovery-week down-tick — NOT a stress signal; a proactive softening. Two events landed together:
+// (1) a fresh coppery terminal flush (tender new tissue, immature cuticle/stomata = high transpiration
+// vulnerability, same tip-burn-prone tissue as the 7/26 episode) and (2) a transplant into a larger pot
+// (2 trip / 1 orchid / 1 potting) — disturbed roots run reduced water uptake for ~1-2 weeks. Lower supply +
+// higher demand → back the ceilings off ~0.15 uniformly so fog holds RH up while the flush hardens and roots
+// re-knit. Ceilings only (floors 0.55/0.70/0.85 untouched — no extra daytime venting). Ladder still
+// non-decreasing (night 0.90 = morning 0.90 < afternoon 1.00 = eve HI 1.00 < cap 1.25). TEMPORARY: re-raise
+// toward the 7/26 ladder once the copper greens up and new roots establish (~1 week). Monitor-and-adjust.
+const float VPD_EVE_LO   = 0.85, VPD_EVE_HI   = 1.00;  // 8/04 recovery-week (7/26 1.15; 7/23 1.20; 7/15b 1.30); only when sun detected
+const float VPD_EVE_CAP  = 1.25;                       // 8/04 recovery-week (7/26 1.40; 7/23 1.45; 7/15b 1.50); solar-window fog trigger / ceiling
 const float VPD_DEADBAND = 0.05;                      // anti-chatter on the VPD loop
 
 // Sun-detection gate for the evening pulse: sun = ambient OR canopy crosses threshold, sustained.
@@ -357,7 +365,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.12";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.13";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;

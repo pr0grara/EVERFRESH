@@ -4,6 +4,13 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.13 — 2026-08-04
+Recovery-week VPD softening. Proactive (not a stress signal): a fresh coppery terminal flush landed the same week as a transplant into a larger pot (2 trip / 1 orchid / 1 potting). Tender new tissue + disturbed roots = lower water supply against higher demand, so ease evaporative pull for ~1 week while the flush hardens and roots re-knit.
+
+- **Ceilings down ~0.15 uniformly** (floors 0.55/0.70/0.85 untouched, so no extra daytime venting; fog just comes on sooner): night/morning `_HI` 1.05→0.90, afternoon 1.15→1.00, evening `_HI` 1.15→1.00, spike `VPD_EVE_CAP` 1.40→1.25.
+- Ladder still non-decreasing (night 0.90 = morning 0.90 < afternoon 1.00 = eve HI 1.00 < cap 1.25).
+- **Temporary** — re-raise toward the 7/26 ladder once the copper greens up and roots establish.
+
 ## v1.2.12 — 2026-07-28
 Night vent noise cap. Full-duty venting (cooling pulse / RH relief / dry swing / scheduled exchange) was a 100% blast — too loud at night.
 
