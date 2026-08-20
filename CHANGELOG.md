@@ -4,6 +4,13 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.14 — 2026-08-20
+Circ-fan mixing-failure watchdog + SMS alert. The circ fan died 8/20 (inertial bearing lock, freed by hand). Post-mortem on the sheet log showed it had been dying for ~2 weeks — clean ΔT baseline (canopy−ambient ~4-5°F) held until ~8/05, then intermittent stalls spiking ΔT to 24-31°F, lengthening each time (minutes → 40 → 89 → locked). The tell is ΔT, not fog/vent runtime: a real solar spike keeps ΔT low (canopy+ambient rise together), but a stalled fan lets the canopy pocket bake, and stalls hit at all hours incl. dark ones (mechanical, not solar).
+
+- **New `circMixingStalled()` detector** → publishes `everfresh/alert` = `"circ-stall"` when `(canopy − ambient) ≥ CIRC_STALL_ON_DELTA_F` (12°F) holds for `CIRC_STALL_MS` (10 min); clears below `CIRC_STALL_OFF_DELTA_F` (9°F). Hysteretic + time-latched so solar-edge transients can't trip it. Needs both sensors (ambient down → can't judge mixing; no-sensor alert covers canopy loss).
+- Folded into `publishAlerts()` priority after no-sensor/overheat (edge-triggered — only publishes on transition).
+- **Off-device:** a Particle webhook forwards `everfresh/alert` → arabuilds `/api/everfresh-alert` → Twilio SMS to Ara's cell (from the arabuilds line +14159032724) on any real alert, "cleared" on recovery. Would have paged ~8/07, two weeks before failure.
+
 ## v1.2.13 — 2026-08-04
 Recovery-week VPD softening. Proactive (not a stress signal): a fresh coppery terminal flush landed the same week as a transplant into a larger pot (2 trip / 1 orchid / 1 potting). Tender new tissue + disturbed roots = lower water supply against higher demand, so ease evaporative pull for ~1 week while the flush hardens and roots re-knit.
 

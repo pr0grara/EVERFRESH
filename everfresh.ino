@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.13 (2026-08-04) — see CHANGELOG.md
+ * Version: v1.2.14 (2026-08-20) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -59,6 +59,17 @@ const uint8_t ADDR_AMBIENT = 0x44;
 const float HEAT_ON_F     = 76.0;   // heater ON below this
 const float HEAT_OFF_F    = 78.5;   // heater OFF above this (hysteresis)
 const float TEMP_SAFETY_F = 92.0;   // canopy above this => heater hard OFF + "hot" alarm (no longer force-vents)
+
+// --- Circ-fan mixing-failure watchdog (v1.2.14) ---
+// A healthy circ fan mixes the chamber, so canopy and ambient track within a few °F. When the fan
+// stalls (bearing seizes / inertial-lock), the canopy pocket bakes with no air movement and the
+// canopy-minus-ambient gap blows out. The 8/20 circ-fan death showed this creeping for ~2 weeks:
+// clean baseline held ΔT ~4-5°F, every stall spiked it to 24-31°F (at all hours, incl. dark ones —
+// so it's mechanical, not solar; a real solar spike keeps ΔT low because canopy+ambient rise together).
+// This is the cheap always-available tell. Fire "circ-stall" alert if ΔT holds high long enough.
+const float CIRC_STALL_ON_DELTA_F  = 12.0;   // canopy this much hotter than ambient = no mixing (engage)
+const float CIRC_STALL_OFF_DELTA_F = 9.0;    // release hysteresis — clears when gap recovers below this
+const unsigned long CIRC_STALL_MS  = 10UL * 60UL * 1000UL;   // must persist 10 min (skips brief solar-edge blips)
 const float COOL_ON_F     = 90.0;   // cooling (fog + vent) ON above this — raised 84→90 (7/14): a hot
                                     // tropical afternoon regularly rides 85-100°F; don't fight heat until 90
 const float COOL_OFF_F    = 88.0;   // cooling OFF below this (fixed floor; vent adds an elastic ambient floor below)
@@ -365,7 +376,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.13";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.14";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1342,10 +1353,30 @@ void publishTelemetry() {
   Particle.publish("everfresh/telemetry", json, PRIVATE);
 }
 
+// Circ-fan mixing-failure detector: sustained canopy≫ambient ΔT = air isn't moving. Hysteretic +
+// time-latched so a healthy solar transient can't trip it and a recovering gap clears it cleanly.
+// Needs BOTH sensors; if ambient is down we can't judge mixing (the no-sensor alert covers canopy loss).
+bool circMixingStalled() {
+  static unsigned long highSince = 0;
+  static bool latched = false;
+  if (!sensorsValid || !ambient.ok) { highSince = 0; latched = false; return false; }
+  float dt = ctrlTempF - ambient.tempF;
+  unsigned long now = millis();
+  if (dt >= CIRC_STALL_ON_DELTA_F) {
+    if (highSince == 0) highSince = now;
+    if (now - highSince >= CIRC_STALL_MS) latched = true;
+  } else if (dt < CIRC_STALL_OFF_DELTA_F) {
+    highSince = 0; latched = false;
+  }
+  // between OFF and ON deltas while latched: hold state (hysteresis band)
+  return latched;
+}
+
 void publishAlerts() {
   const char *alert = "";
   if (!sensorsValid)                   alert = "no-sensor";
   else if (ctrlTempF >= TEMP_SAFETY_F) alert = "overheat";
+  else if (circMixingStalled())        alert = "circ-stall";
   if (strcmp(alert, lastAlert) != 0) {
     strncpy(lastAlert, alert, sizeof(lastAlert) - 1);
     if (alert[0]) Particle.publish("everfresh/alert", alert, PRIVATE);
