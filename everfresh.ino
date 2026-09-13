@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.16 (2026-09-13) — see CHANGELOG.md
+ * Version: v1.2.17 (2026-09-13) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -70,6 +70,10 @@ const float TEMP_SAFETY_F = 92.0;   // canopy above this => heater hard OFF + "h
 const float CIRC_STALL_ON_DELTA_F  = 12.0;   // canopy this much hotter than ambient = no mixing (engage)
 const float CIRC_STALL_OFF_DELTA_F = 9.0;    // release hysteresis — clears when gap recovers below this
 const unsigned long CIRC_STALL_MS  = 10UL * 60UL * 1000UL;   // must persist 10 min (skips brief solar-edge blips)
+// Re-nag cadence for a persistent alert (circ-stall/overheat/no-sensor): those publish once on the
+// edge, but a fault that doesn't self-heal shouldn't fall silent — re-fire every 12h while it holds.
+// Same 12h as the reservoir-dry nag (RES_REALERT_MS); kept a separate name for the two alert paths.
+const unsigned long ALERT_REALERT_MS = 12UL * 60UL * 60UL * 1000UL;
 
 // --- Reservoir dry-out watchdog (v1.2.16) ---
 // The fogger draws a ~3-4 qt reservoir (~2-3 wk horizon). When it runs dry the transducer keeps firing
@@ -392,7 +396,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.16";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.17";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1424,14 +1428,23 @@ void publishReservoirAlert() {
 }
 
 void publishAlerts() {
+  static unsigned long lastAlertPub = 0;   // when the active alert was last published (for the re-nag)
   const char *alert = "";
   if (!sensorsValid)                   alert = "no-sensor";
   else if (ctrlTempF >= TEMP_SAFETY_F) alert = "overheat";
   else if (circMixingStalled())        alert = "circ-stall";
+  unsigned long now = millis();
   if (strcmp(alert, lastAlert) != 0) {
     strncpy(lastAlert, alert, sizeof(lastAlert) - 1);
+    lastAlertPub = now;
     if (alert[0]) Particle.publish("everfresh/alert", alert, PRIVATE);
     else          Particle.publish("everfresh/alert", "cleared", PRIVATE);
+  } else if (alert[0] && (now - lastAlertPub >= ALERT_REALERT_MS)) {
+    // Same fault still active 12h later: re-fire it (bidaily nag) so a persistent circ-stall /
+    // overheat / no-sensor doesn't fall silent after its one edge-triggered text. Matches the
+    // reservoir-dry cadence. Only non-empty alerts nag; "cleared" fires once on recovery.
+    lastAlertPub = now;
+    Particle.publish("everfresh/alert", alert, PRIVATE);
   }
 }
 

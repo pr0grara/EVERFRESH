@@ -4,6 +4,9 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.17 — 2026-09-13
+Persistent-alert bidaily nag. The edge-triggered alerts in `publishAlerts()` (circ-stall / overheat / no-sensor) fired exactly once on transition, so a fault that didn't self-heal went silent after its first text. Now, matching the v1.2.16 reservoir-dry cadence, `publishAlerts()` re-publishes the still-active alert every `ALERT_REALERT_MS` (12h) while the same condition holds. Requested for circ-stall specifically; generalized to all three since none self-heal and re-nagging a sustained overheat/no-sensor is strictly safer. `"cleared"` still fires once on recovery (no nag). New static `lastAlertPub` timer; reset on every edge so a changed alert re-arms the clock.
+
 ## v1.2.16 — 2026-09-13
 Reservoir dry-out watchdog + bidaily SMS nag. On 9/12 the fogger reservoir ran dry ~8:47PM; the sheet log showed the signature cleanly — fog pinned 100% ON continuously while canopy RH decoupled and slid 75→57%, then sat at ~55-58% for ~14h with fog at full duty (transducer firing into empty water, atomizing nothing). No alert fired at the time; this adds one.
 
