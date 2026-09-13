@@ -4,6 +4,16 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.16 — 2026-09-13
+Reservoir dry-out watchdog + bidaily SMS nag. On 9/12 the fogger reservoir ran dry ~8:47PM; the sheet log showed the signature cleanly — fog pinned 100% ON continuously while canopy RH decoupled and slid 75→57%, then sat at ~55-58% for ~14h with fog at full duty (transducer firing into empty water, atomizing nothing). No alert fired at the time; this adds one.
+
+- **New `publishReservoirAlert()` detector** → publishes `everfresh/alert` = `"reservoir-dry"` when fog is commanded ON continuously for `RES_DRY_MS` (20 min) while canopy RH stays below `RES_DRY_RH` (= `RH_FOG_ON`, 65%). A watered chamber recovers RH within minutes and cycles fog off, so a 20-min flat-out run with no RH response is the dry tell. Clears (`"reservoir-refilled"`) when RH recovers above `RES_OK_RH` (72%) — sits cleanly between the ~55-58% dry floor and the 74-80% normal band so it won't false-clear or nag forever.
+- **Bidaily nag:** unlike the edge-triggered alerts, this re-publishes `reservoir-dry` every `RES_REALERT_MS` (12h) while still dry — a refill reminder, since a dry reservoir doesn't self-heal. Deliberately independent of `publishAlerts()`'s single-slot priority system so it can coexist with a simultaneous circ-stall/overheat and keep its own cadence. No-sensor holds the latch (can't judge RH response blind; the no-sensor alert covers that).
+- **Off-device:** reuses the v1.2.14 path — Particle webhook → arabuilds `/api/everfresh-alert` → Twilio SMS. Added `reservoir-dry` / `reservoir-refilled` message bodies there.
+
+## v1.2.15 — 2026-09-08
+Baseline circ-mix bump. Raised `CIRC_MIX_DUTY` 1%→10% for stronger continuous chamber mixing between fog cycles. Note this floor also drives the mode-3 night dry-excursion pin (circ held at `CIRC_MIX_DUTY` when `excDrying`), so night idle mixing rises to 10% too; `CIRC_NIGHT_MIN` (1) and `HEAT_CIRC_MIN` (1) are separate constants and unchanged. Watch the floor pool for over-drying at the higher baseline.
+
 ## v1.2.14 — 2026-08-20
 Circ-fan mixing-failure watchdog + SMS alert. The circ fan died 8/20 (inertial bearing lock, freed by hand). Post-mortem on the sheet log showed it had been dying for ~2 weeks — clean ΔT baseline (canopy−ambient ~4-5°F) held until ~8/05, then intermittent stalls spiking ΔT to 24-31°F, lengthening each time (minutes → 40 → 89 → locked). The tell is ΔT, not fog/vent runtime: a real solar spike keeps ΔT low (canopy+ambient rise together), but a stalled fan lets the canopy pocket bake, and stalls hit at all hours incl. dark ones (mechanical, not solar).
 

@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.14 (2026-08-20) — see CHANGELOG.md
+ * Version: v1.2.16 (2026-09-13) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -70,6 +70,22 @@ const float TEMP_SAFETY_F = 92.0;   // canopy above this => heater hard OFF + "h
 const float CIRC_STALL_ON_DELTA_F  = 12.0;   // canopy this much hotter than ambient = no mixing (engage)
 const float CIRC_STALL_OFF_DELTA_F = 9.0;    // release hysteresis — clears when gap recovers below this
 const unsigned long CIRC_STALL_MS  = 10UL * 60UL * 1000UL;   // must persist 10 min (skips brief solar-edge blips)
+
+// --- Reservoir dry-out watchdog (v1.2.16) ---
+// The fogger draws a ~3-4 qt reservoir (~2-3 wk horizon). When it runs dry the transducer keeps firing
+// into empty water but atomizes nothing — so fog stays commanded ON continuously while canopy RH refuses
+// to recover. Proven 9/12: fog pinned 100% at 8:47PM, canopy RH slid 75→57% over the next hour and stuck
+// at ~55-58% for ~14h with fog at full duty. The tell is exactly that decouple: sustained fog-ON with RH
+// still stuck below the fog-ON point. Fire "reservoir-dry"; re-fire ~2x/day while still dry (refill nag).
+const float         RES_DRY_RH     = 65.0;                          // RH still under this while fogging = not recovering
+                                                                    // (mirrors RH_FOG_ON, declared below; kept a literal to
+                                                                    // avoid a forward-reference — keep the two in sync)
+const float         RES_OK_RH      = 72.0;                          // RH back above this = water restored (clears latch;
+                                                                    // normal band is 74-80%, dry floor ~55-58%, so this
+                                                                    // sits cleanly between and won't false-clear or nag forever)
+const unsigned long RES_DRY_MS     = 20UL * 60UL * 1000UL;          // fog continuously ON this long w/ low RH = dry
+                                                                    // (a watered chamber recovers RH in minutes → fog cycles off)
+const unsigned long RES_REALERT_MS = 12UL * 60UL * 60UL * 1000UL;   // re-text every 12h while still dry (bidaily nag)
 const float COOL_ON_F     = 90.0;   // cooling (fog + vent) ON above this — raised 84→90 (7/14): a hot
                                     // tropical afternoon regularly rides 85-100°F; don't fight heat until 90
 const float COOL_OFF_F    = 88.0;   // cooling OFF below this (fixed floor; vent adds an elastic ambient floor below)
@@ -86,7 +102,7 @@ const int CIRC_FOG_DUTY = 100;   // % while fogging (disperse mist)
 // sustains RH between fog cycles and dries the floor (no fresh air pulled in).
 // Proven on 6/20: with mixing running, canopy RH decayed far slower and the fogger
 // stopped thrashing; with mixing off, RH crashed and refired every ~5 min.
-const int CIRC_MIX_DUTY = 1;    // % continuous mix speed (lower if floor over-dries / too much leaf airflow; 0 = mixing OFF)
+const int CIRC_MIX_DUTY = 10;   // % continuous mix speed (raised 1→10 on 9/08 for stronger baseline mixing; lower if floor over-dries / too much leaf airflow; 0 = mixing OFF)
 // Night idle floor (7/14): mode-3 night USED to hard-zero circ (avoid re-wetting the floor pool during
 // dry-down). But the temp regime rose ~10°F — nights now run ~80°F / ~82% RH, so the risk inverted from
 // re-wetting to STAGNATION (still, warm, saturated air = fungal boundary layer on the leaves). Hold a
@@ -376,7 +392,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.14";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.16";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1372,6 +1388,41 @@ bool circMixingStalled() {
   return latched;
 }
 
+// Reservoir dry-out detector + bidaily re-alert. Deliberately INDEPENDENT of publishAlerts()'s
+// single-slot priority system, so it can (a) coexist with a simultaneous circ-stall/overheat and
+// (b) re-fire on its own 12h cadence — the existing edge-triggered alerts fire once, this one nags.
+// Engage: fog commanded ON continuously for RES_DRY_MS while canopy RH never climbs out of the
+// fog-ON zone (fogger running flat-out but atomizing nothing). Clear: RH recovers above RES_OK_RH.
+void publishReservoirAlert() {
+  static unsigned long fogOnSince = 0;   // millis fog went continuously ON (0 = fog currently off)
+  static bool          dry        = false;
+  static unsigned long lastPub    = 0;   // last reservoir-dry publish (for the 12h nag cadence)
+  unsigned long now = millis();
+
+  // No canopy sensor → can't judge RH response (the no-sensor alert covers blindness). Hold latch,
+  // don't clear on a blip; reset the fog-run timer so we don't engage on stale readings.
+  if (!sensorsValid) { fogOnSince = 0; return; }
+
+  if (fogOn) { if (fogOnSince == 0) fogOnSince = now; }
+  else       { fogOnSince = 0; }
+
+  if (!dry) {
+    if (fogOnSince && (now - fogOnSince >= RES_DRY_MS) && ctrlRH < RES_DRY_RH) {
+      dry = true;
+      lastPub = now;
+      Particle.publish("everfresh/alert", "reservoir-dry", PRIVATE);
+    }
+  } else {
+    if (ctrlRH >= RES_OK_RH) {
+      dry = false;
+      Particle.publish("everfresh/alert", "reservoir-refilled", PRIVATE);
+    } else if (now - lastPub >= RES_REALERT_MS) {
+      lastPub = now;
+      Particle.publish("everfresh/alert", "reservoir-dry", PRIVATE);   // bidaily refill reminder
+    }
+  }
+}
+
 void publishAlerts() {
   const char *alert = "";
   if (!sensorsValid)                   alert = "no-sensor";
@@ -1467,6 +1518,7 @@ void loop() {
     readSensors();
     control();
     publishAlerts();
+    publishReservoirAlert();
     publishStateChanges();
   }
 
