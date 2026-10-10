@@ -1,6 +1,6 @@
 /*
  * EVERFRESH — Cojoba Angustifolia greenhouse controller
- * Version: v1.2.17 (2026-09-13) — see CHANGELOG.md
+ * Version: v1.2.18 (2026-10-09) — see CHANGELOG.md
  * Target: Particle Photon (original) / Photon 2 / Argon
  *
  * Sensors : 2x SHT31, each on its OWN 2-wire bus (both fixed at addr 0x44)
@@ -30,6 +30,15 @@
  */
 
 #include <math.h>   // NAN, isnan(), expf()
+
+// Run the app on its own thread so control never depends on the cloud (v1.2.18). Without this, a
+// Wi-Fi/cloud outage blocks loop() while the system reconnects, the 60 s ApplicationWatchdog resets the
+// Photon, and on reboot setup() never runs until the cloud is back: every actuator pin floats off for
+// the whole outage (the 2026-10-08 modem death left the chamber uncontrolled 26.6 h).
+SYSTEM_THREAD(ENABLED);
+
+bool cloudPub(const char *ev, const char *data);
+bool cloudPub(const char *ev, const String &data);
 
 // ========================= CONFIG (edit me) =========================
 
@@ -396,7 +405,7 @@ int    cloudHeat = 0, cloudFog = 0, cloudCirc = 0, cloudVent = 0;
 char   cloudMode[16]    = "auto";
 char   cloudStatus[240] = "boot";
 char   lastAlert[40]    = "";
-char   cloudVersion[16] = "v1.2.17";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
+char   cloudVersion[16] = "v1.2.18";   // firmware build id — exposed as the "version" cloud var so a flash is verifiable remotely
 
 // State-change event de-dup
 bool prevHeat=false, prevFog=false, prevCirc=false, prevVent=false;
@@ -1282,14 +1291,14 @@ bool parseState(String arg, unsigned long &secs) {
 int fnSetFog(String arg) {
   unsigned long s; bool on = parseState(arg, s);
   fogOverrideOn = on; fogOverrideUntil = millis() + s * 1000;
-  Particle.publish("everfresh/cmd", String::format("fog %s %lus", on ? "on" : "off", s), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("fog %s %lus", on ? "on" : "off", s));
   return on ? 1 : 0;
 }
 // setHeat("1") / setHeat("0") [,seconds] -> force heater ON/OFF (overheat cutoff still applies).
 int fnSetHeat(String arg) {
   unsigned long s; bool on = parseState(arg, s);
   heatOverrideOn = on; heatOverrideUntil = millis() + s * 1000;
-  Particle.publish("everfresh/cmd", String::format("heat %s %lus", on ? "on" : "off", s), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("heat %s %lus", on ? "on" : "off", s));
   return on ? 1 : 0;
 }
 // setCirc("80") or setCirc("80,120") -> hold circ fan at 80% for 120s.
@@ -1298,7 +1307,7 @@ int fnSetCirc(String arg) {
   int duty = parseDuty(comma >= 0 ? arg.substring(0, comma) : arg);
   unsigned long s = clampSeconds(comma >= 0 ? arg.substring(comma + 1) : "");
   circOverrideDuty = duty; circOverrideUntil = millis() + s * 1000;
-  Particle.publish("everfresh/cmd", String::format("circ %d%% %lus", duty, s), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("circ %d%% %lus", duty, s));
   return duty;
 }
 // setVent("100") or setVent("100,300") -> hold vent fan at 100% for 300s.
@@ -1307,12 +1316,12 @@ int fnSetVent(String arg) {
   int duty = parseDuty(comma >= 0 ? arg.substring(0, comma) : arg);
   unsigned long s = clampSeconds(comma >= 0 ? arg.substring(comma + 1) : "");
   ventOverrideDuty = duty; ventOverrideUntil = millis() + s * 1000;
-  Particle.publish("everfresh/cmd", String::format("vent %d%% %lus", duty, s), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("vent %d%% %lus", duty, s));
   return duty;
 }
 int fnClearOverrides(String arg) {
   heatOverrideUntil = fogOverrideUntil = circOverrideUntil = ventOverrideUntil = 0;
-  Particle.publish("everfresh/cmd", "cleared", PRIVATE);
+  cloudPub("everfresh/cmd", "cleared");
   return 0;
 }
 // setPhase("-1") => live clock; setPhase("0".."3") => force PH_NIGHT/MORNING/AFTERNOON/EVENING;
@@ -1326,7 +1335,7 @@ int fnSetPhase(String arg) {
   forcedPhase = n;
   String s = (comma >= 0 ? arg.substring(comma + 1) : ""); s.trim();
   forcedSun = (s == "1" || s.equalsIgnoreCase("sun"));
-  Particle.publish("everfresh/cmd", String::format("phase %d sun=%d", forcedPhase, forcedSun ? 1 : 0), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("phase %d sun=%d", forcedPhase, forcedSun ? 1 : 0));
   return forcedPhase;
 }
 // setControlMode("0|1|2|3") -> 0 RH bang-bang, 1 VPD bang-bang, 2 regime-PI, 3 excursion. The
@@ -1339,7 +1348,7 @@ int fnSetControlMode(String arg) {
   piState.integ = 0; piState.fogEffort = 0; piState.ventEffort = 0;   // clean handoff
   excState = EX_REST; excRestUntil = 0; excArmSince = 0; excWantVent = false; excWantFog = false;
   nightExportLatched = false; nightExportSince = 0; nightExportOn = false;   // clean handoff
-  Particle.publish("everfresh/cmd", String::format("controlMode %d", controlMode), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("controlMode %d", controlMode));
   return controlMode;
 }
 // setRegime("-1") => live (dew-point gap); "0|1|2" => force DRY/NEUTRAL/WET for bench testing
@@ -1349,7 +1358,7 @@ int fnSetRegime(String arg) {
   int r = (arg.length() ? arg.toInt() : -1);
   if (r < -1) r = -1; if (r > 2) r = 2;
   forcedRegime = r;
-  Particle.publish("everfresh/cmd", String::format("regime %d", forcedRegime), PRIVATE);
+  cloudPub("everfresh/cmd", String::format("regime %d", forcedRegime));
   return forcedRegime;
 }
 
@@ -1370,7 +1379,7 @@ void publishTelemetry() {
     phaseName(curPhase), cloudVpdTarget, sunDetected ? 1 : 0,
     controlMode, cloudCanopyDP, cloudAmbientDP, cloudDpGap, regimeName(curRegime),
     piState.ventEffort, piState.fogEffort, cloudVersion);
-  Particle.publish("everfresh/telemetry", json, PRIVATE);
+  cloudPub("everfresh/telemetry", json);
 }
 
 // Circ-fan mixing-failure detector: sustained canopy≫ambient ΔT = air isn't moving. Hysteretic +
@@ -1391,6 +1400,14 @@ bool circMixingStalled() {
   // between OFF and ON deltas while latched: hold state (hysteresis band)
   return latched;
 }
+
+// Publish only when the cloud is up. With the app threaded, a publish attempted offline would just fail
+// (or stall the app thread on a half-dead link); returns false so a caller can retry an alert later.
+bool cloudPub(const char *ev, const char *data) {
+  if (!Particle.connected()) return false;
+  return Particle.publish(ev, data, PRIVATE);
+}
+bool cloudPub(const char *ev, const String &data) { return cloudPub(ev, data.c_str()); }
 
 // Reservoir dry-out detector + bidaily re-alert. Deliberately INDEPENDENT of publishAlerts()'s
 // single-slot priority system, so it can (a) coexist with a simultaneous circ-stall/overheat and
@@ -1414,15 +1431,15 @@ void publishReservoirAlert() {
     if (fogOnSince && (now - fogOnSince >= RES_DRY_MS) && ctrlRH < RES_DRY_RH) {
       dry = true;
       lastPub = now;
-      Particle.publish("everfresh/alert", "reservoir-dry", PRIVATE);
+      cloudPub("everfresh/alert", "reservoir-dry");
     }
   } else {
     if (ctrlRH >= RES_OK_RH) {
       dry = false;
-      Particle.publish("everfresh/alert", "reservoir-refilled", PRIVATE);
+      cloudPub("everfresh/alert", "reservoir-refilled");
     } else if (now - lastPub >= RES_REALERT_MS) {
       lastPub = now;
-      Particle.publish("everfresh/alert", "reservoir-dry", PRIVATE);   // bidaily refill reminder
+      cloudPub("everfresh/alert", "reservoir-dry");   // bidaily refill reminder
     }
   }
 }
@@ -1435,16 +1452,18 @@ void publishAlerts() {
   else if (circMixingStalled())        alert = "circ-stall";
   unsigned long now = millis();
   if (strcmp(alert, lastAlert) != 0) {
-    strncpy(lastAlert, alert, sizeof(lastAlert) - 1);
-    lastAlertPub = now;
-    if (alert[0]) Particle.publish("everfresh/alert", alert, PRIVATE);
-    else          Particle.publish("everfresh/alert", "cleared", PRIVATE);
+    // Latch the edge only once it actually went out, so an alert raised while offline is retried
+    // each control cycle and lands when the cloud returns instead of being lost (v1.2.18).
+    if (cloudPub("everfresh/alert", alert[0] ? alert : "cleared")) {
+      strncpy(lastAlert, alert, sizeof(lastAlert) - 1);
+      lastAlertPub = now;
+    }
   } else if (alert[0] && (now - lastAlertPub >= ALERT_REALERT_MS)) {
     // Same fault still active 12h later: re-fire it (bidaily nag) so a persistent circ-stall /
     // overheat / no-sensor doesn't fall silent after its one edge-triggered text. Matches the
     // reservoir-dry cadence. Only non-empty alerts nag; "cleared" fires once on recovery.
     lastAlertPub = now;
-    Particle.publish("everfresh/alert", alert, PRIVATE);
+    cloudPub("everfresh/alert", alert);
   }
 }
 
@@ -1453,7 +1472,7 @@ void publishStateChange(const char *what, bool on) {
   snprintf(ev, sizeof(ev),
     "{\"ev\":\"%s\",\"state\":\"%s\",\"ct\":%.1f,\"crh\":%.0f}",
     what, on ? "on" : "off", cloudCanopyT, cloudCanopyRH);
-  Particle.publish("everfresh/event", ev, PRIVATE);
+  cloudPub("everfresh/event", ev);
 }
 
 void publishStateChanges() {

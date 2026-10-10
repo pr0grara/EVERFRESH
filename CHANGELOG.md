@@ -4,6 +4,14 @@ Firmware (`everfresh.ino`) version history, newest first. Each entry: version �
 
 > Renumbered 2026-07-09 so each minor line tracks a control paradigm: `1.1.x` = the VPD-control era, `1.2.x` = the ceramic-heater era. Git commit subjects predating this use the older flat `1.0.x` numbers.
 
+## v1.2.18 — 2026-10-09
+Control survives a Wi-Fi/cloud outage. On 10/8 the modem died and the Photon was dark 26.6h. Without `SYSTEM_THREAD(ENABLED)` the app shared the system thread: losing the cloud blocked `loop()`, the 60s `ApplicationWatchdog` reset the device, and after each reset `setup()` waited for the cloud, so every actuator pin floated off for the whole outage (reconnected at 165s uptime, canopy at 59% RH).
+
+- **`SYSTEM_THREAD(ENABLED)`:** setup and the control loop run from boot regardless of Wi-Fi. Before the clock syncs, the existing afternoon-phase fallback applies.
+- **`cloudPub()` wrapper** replaces every `Particle.publish`: skips when `!Particle.connected()` so an offline publish can't stall the app thread.
+- **Edge alerts retry:** `publishAlerts()` latches a circ-stall / overheat / no-sensor / cleared edge only after the publish succeeds, so an alert raised offline lands when the cloud returns.
+- **Off-device companion:** the arabuilds scheduler job "everfresh watchdog" (every 5 min) texts when telemetry goes stale for 20 min, and again when it resumes.
+
 ## v1.2.17 — 2026-09-13
 Persistent-alert bidaily nag. The edge-triggered alerts in `publishAlerts()` (circ-stall / overheat / no-sensor) fired exactly once on transition, so a fault that didn't self-heal went silent after its first text. Now, matching the v1.2.16 reservoir-dry cadence, `publishAlerts()` re-publishes the still-active alert every `ALERT_REALERT_MS` (12h) while the same condition holds. Requested for circ-stall specifically; generalized to all three since none self-heal and re-nagging a sustained overheat/no-sensor is strictly safer. `"cleared"` still fires once on recovery (no nag). New static `lastAlertPub` timer; reset on every edge so a changed alert re-arms the clock.
 
