@@ -9,3 +9,7 @@ __pycache__/
 scratchpad_log.csv
 
 .wrangler/
+
+# CAD brief build: personal photos and rendered output stay local
+cad-brief/v1-photos/
+cad-brief/out/
